@@ -1,0 +1,46 @@
+@import 'tailwindcss';
+@import 'ol/ol.css';
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: #0b1020;
+  color: #e2e8f0;
+  font-family:
+    'Pretendard',
+    -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    system-ui,
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* OpenLayers 기본 컨트롤을 다크 테마에 맞춘다 */
+.ol-control {
+  background: rgba(15, 23, 42, 0.6);
+  border-radius: 6px;
+}
+.ol-control button {
+  background: rgba(51, 65, 85, 0.9);
+  color: #e2e8f0;
+}
+.ol-control button:hover {
+  background: rgba(71, 85, 105, 1);
+}
+.ol-attribution {
+  font-size: 10px;
+}
+
+/* 실시간 갱신이 잦은 표에서 스크롤바가 레이아웃을 흔들지 않게 */
+.scroll-stable {
+  scrollbar-gutter: stable;
+}
