@@ -143,7 +143,80 @@ FPS·최저 FPS·최장 프레임·수신 지연을 읽는다.
 > (SwiftShader)으로 떨어져 Canvas보다 **느리게** 나온다. 반드시 실제 GPU가 있는
 > 브라우저에서 측정할 것. `chrome://gpu`에서 하드웨어 가속을 먼저 확인한다.
 
-### 2단계 — rAF 코얼레싱 ✅
+### 결과 표 — 렌더 경로 (직접 채울 것)
+
+| 로봇 대수 | Canvas 평균 FPS | Canvas 최저 | WebGL 평균 FPS | WebGL 최저 | 개선 |
+| --- | --- | --- | --- | --- | --- |
+| 500 | | | | | |
+| 1,000 | | | | | |
+| 2,000 | | | | | |
+| 5,000 | | | | | |
+
+### 결과 표 — 최적화 단계
+
+최적화 단계는 **단계별 커밋을 하나씩 체크아웃해** 측정한다.
+
+```bash
+git log --oneline               # 단계별 커밋 확인
+git checkout <커밋>             # 해당 단계 상태로 이동
+FLEET_SIZE=20000 yarn dev       # 측정 → http://localhost:3000/fleet
+```
+
+> ⚠️ **부하를 충분히 올려야 차이가 보인다.** 2,000대와 5,000대에서는 최적화 전에도
+> 60 FPS가 나온다. 아낀 시간이 16.6ms 프레임 예산 안에 묻히기 때문이다. 병목이
+> 아닌 곳을 최적화하면 측정에 아무것도 안 나온다 — 그 사실 자체가 배울 점이다.
+
+Canvas 모드, 줌아웃(전체 보기), 헤드리스 Chrome 기준.
+
+| 단계 | 평균 FPS | 최저 FPS | 최장 프레임 |
+| --- | --- | --- | --- |
+| 0. 소박한 루프 (before) | | | |
+| 1. silent 갱신 + changed() 1회 | | | |
+| 2. + rAF 코얼레싱 | | | |
+| 3. + 뷰포트 컬링 | | | |
+| 3. + 뷰포트 컬링 (줌인) | | | |
+
+---
+
+## 최적화 로드맵
+
+`FleetMap.tsx`의 프레임 갱신 루프에 1~4단계를 순서대로 적용했다. 각 단계가 **무엇을
+아끼는지**와 **어떤 대가를 치르는지**를 아래에 적고, 근거가 되는 OpenLayers 내부
+동작은 `FleetMap.tsx`의 해당 지점 주석에 남겼다.
+
+### 1. 이벤트 디스패치 줄이기 ✅
+
+`setCoordinates` 한 번이 실제로 하는 일은 좌표 대입이 아니다.
+
+```
+Point.setCoordinates → geometry.changed()          revision++ / 'change'
+  → Feature.handleGeometryChange_ → feature.changed()   'change'
+    → VectorSource.handleFeatureChange_
+        ├ geometry.getExtent()
+        ├ featuresRtree_.update(extent, feature)   ← RBush remove + insert
+        ├ source.changed()
+        └ dispatchEvent('changefeature')
+```
+
+프레임당 2,000대면 이벤트 6,000회 + RBush 재삽입 2,000회다. 주석이 지목한
+이벤트보다 **R-tree 리밸런싱이 더 무겁다.**
+
+→ `Point`의 내부 `flatCoordinates`를 인플레이스로 덮어쓰고, 루프가 끝난 뒤
+`source.changed()`를 한 번만 호출한다.
+
+**전제조건이 두 개 있고, 둘 다 빠뜨리면 조용히 깨진다.**
+
+- `useSpatialIndex: false`가 **필수**다. 기본값이면 R-tree가 옛 좌표에 멈추고,
+  Canvas 렌더러는 매 프레임 `getFeaturesInExtent()`로 그릴 대상을 고르기 때문에
+  줌인 상태에서 로봇이 사라지거나 옛 자리에 남는다. 이 앱은 피처 수가 고정이고
+  로딩 전략도 없어서 공간 인덱스로 얻을 게 없다.
+- `flatCoordinates` 배열 아이덴티티가 유지된다는 가정에 기대고 있다. 공개 API가
+  아니므로 `tests/ol-invariants.test.ts`가 `ol` 업그레이드 시 깨지도록 못 박았다.
+- `useGeographic()`을 켜면 안 된다. 사용자 투영이 설정되면 렌더러가
+  `simplifyTransformed`에서 geometry를 **clone해 revision으로 메모이즈**하므로,
+  revision이 안 오르는 silent 쓰기는 영원히 무시된다.
+
+### 2. rAF 코얼레싱 ✅
 
 `onFrame`에서는 변한 **id만** Set에 적고, 실제 쓰기는 `requestAnimationFrame`에서
 한 번에 한다. 값을 큐에 쌓지 않는 게 핵심 — 플러시 시점에 최신값을 읽으므로 한
@@ -159,7 +232,7 @@ FPS·최저 FPS·최장 프레임·수신 지연을 읽는다.
 
 대가는 최대 한 화면 프레임(~16ms)의 표시 지연.
 
-### 3단계 — 뷰포트 컬링 ✅
+### 3. 뷰포트 컬링 ✅
 
 플러시마다 뷰 extent를 **한 번** 계산해(로봇마다 계산하면 절약분을 초과한다)
 화면 밖 로봇의 좌표 변환·쓰기를 건너뛴다.
@@ -177,91 +250,30 @@ FPS·최저 FPS·최장 프레임·수신 지연을 읽는다.
   몇 대가 담겨 왔는지(`FleetClient.changedCount`)이고, 우리가 실제로 몇 대를 썼는지와
   무관하다. 효과는 FPS·최장 프레임으로 본다.
 
----
+### 4. Canvas → WebGL 전환 ✅
 
-## 벤치마크 — 여기서부터가 본론 (계속)
+갱신 루프에 렌더 모드 분기가 없다. 그게 1~3단계의 성과다. 다만 **우연이 아니라
+구체적인 이유로** 동작한다.
 
-### 결과 표 — 렌더 경로 (직접 채울 것)
+- `WebGLPointsLayerRenderer`는 피처별 캐시에 `getFlatCoordinates()`가 돌려준
+  **배열을 참조로** 들고 있고, `rebuildBuffers_`가 소스 revision이 오를 때마다 그
+  참조를 다시 읽는다. 그래서 인플레이스 쓰기가 이벤트 없이 반영된다.
+- 반면 **속성**(`statusCode`)은 `changefeature` 이벤트로만 갱신된다. 그래서 루프는
+  좌표만 silent로 쓰고 `statusCode`는 일부러 `feature.set()`으로 쓴다. 이 비대칭이
+  "위치는 움직이는데 색만 안 바뀌는" 버그의 정체다.
 
-| 로봇 대수 | Canvas 평균 FPS | Canvas 최저 | WebGL 평균 FPS | WebGL 최저 | 개선 |
-| --- | --- | --- | --- | --- | --- |
-| 500 | | | | | |
-| 1,000 | | | | | |
-| 2,000 | | | | | |
-| 5,000 | | | | | |
+제약:
 
-### 결과 표 — 최적화 단계
+- 팬·줌 **중**에는 점이 멈춘다(`viewHints`의 ANIMATING/INTERACTING 동안 rebuild
+  스킵). `followSelected`의 400ms 애니메이션 구간도 해당한다. Canvas에는 없다.
+- WebGLPoints에는 뷰포트 컬링이 없다. 화면 밖 피처까지 전부 재업로드하므로
+  3단계가 아끼는 건 CPU 쪽뿐이다.
+- 히트 디텍션이 프레임당 렌더 패스를 하나 더 쓴다. WebGL FPS가 기대만 못하면 첫
+  손질 지점 — 단 클릭 선택을 포기해야 한다.
 
-최적화 단계는 **단계별 커밋을 하나씩 체크아웃해** 측정한다.
+### 5. (선택) Web Worker에서 델타 파싱
 
-```bash
-git log --oneline            # 단계별 커밋 확인
-git checkout <커밋>          # 해당 단계 상태로 이동
-FLEET_SIZE=20000 yarn dev    # 측정
-```
-
-> ⚠️ **부하를 충분히 올려야 차이가 보인다.** 2,000대와 5,000대에서는 최적화 전에도
-> 60 FPS가 나온다. 아낀 시간이 16.6ms 프레임 예산 안에 묻히기 때문이다. 병목이
-> 아닌 곳을 최적화하면 측정에 아무것도 안 나온다 — 그 사실 자체가 배울 점이다.
-
-| 단계 | 평균 FPS | 최저 FPS | 최장 프레임 |
-| --- | --- | --- | --- |
-| 0. 소박한 루프 (before) | | | |
-| 1. silent 갱신 + changed() 1회 | | | |
-| 2. + rAF 코얼레싱 | | | |
-| 3. + 뷰포트 컬링 (줌인) | | | |
-
----
-
-## 최적화 로드맵
-
-`FleetMap.tsx`의 프레임 갱신 루프는 **의도적으로 소박하게** 짜여 있다. 이게
-"before"다. 아래를 순서대로 적용하고 **단계마다 커밋과 측정치를 남기면** 그 자체가
-포트폴리오가 된다.
-
-1. **이벤트 디스패치 줄이기** ✅ — 아래 "1단계" 절 참고.
-2. **rAF 코얼레싱** ✅ — 아래 "2단계" 절 참고.
-3. **뷰포트 컬링** ✅ — 아래 "3단계" 절 참고.
-4. **Canvas → WebGL 전환** — 가장 큰 폭의 개선.
-5. (선택) **Web Worker에서 델타 파싱** — JSON.parse가 메인 스레드를 막는 구간을
-   Performance 탭에서 확인한 뒤에만 착수할 것.
-
-### 1단계 — 이벤트 디스패치 줄이기 ✅
-
-`setCoordinates` 한 번이 실제로 하는 일은 좌표 대입이 아니다.
-
-```
-Point.setCoordinates → geometry.changed()          revision++ / 'change'
-  → Feature.handleGeometryChange_ → feature.changed()   'change'
-    → VectorSource.handleFeatureChange_
-        ├ geometry.getExtent()
-        ├ featuresRtree_.update(extent, feature)   ← RBush remove + insert
-        ├ source.changed()
-        └ dispatchEvent('changefeature')
-```
-
-프레임당 2,000대면 이벤트 6,000회 + RBush 재삽입 2,000회다. 주석이 지목한
-이벤트보다 **R-tree 리밸런싱이 더 무겁다.**
-
-그런데 이 통보는 애초에 낭비다. **렌더러는 다시 그릴 때 소스를 처음부터 전부 다시
-읽는다** — Canvas는 replay group을 새로 만들고, WebGL은 버퍼를 새로 채운다. 증분
-갱신 같은 건 없다. "누가 변했는지"를 2,000번 알릴 필요가 없고 "뭔가 변했다"를 1번
-알리면 결과가 같다.
-
-→ `Point`의 내부 `flatCoordinates`를 인플레이스로 덮어쓰고, 루프가 끝난 뒤
-`source.changed()`를 한 번만 호출한다.
-
-**전제조건이 두 개 있고, 둘 다 빠뜨리면 조용히 깨진다.**
-
-- `useSpatialIndex: false`가 **필수**다. 기본값이면 R-tree가 옛 좌표에 멈추고,
-  Canvas 렌더러는 매 프레임 `getFeaturesInExtent()`로 그릴 대상을 고르기 때문에
-  줌인 상태에서 로봇이 사라지거나 옛 자리에 남는다. 이 앱은 피처 수가 고정이고
-  로딩 전략도 없어서 공간 인덱스로 얻을 게 없다.
-- `flatCoordinates` 배열 아이덴티티가 유지된다는 가정에 기대고 있다. 공개 API가
-  아니므로 `tests/ol-invariants.test.ts`가 `ol` 업그레이드 시 깨지도록 못 박았다.
-- `useGeographic()`을 켜면 안 된다. 사용자 투영이 설정되면 렌더러가
-  `simplifyTransformed`에서 geometry를 **clone해 revision으로 메모이즈**하므로,
-  revision이 안 오르는 silent 쓰기는 영원히 무시된다.
+`JSON.parse`가 메인 스레드를 막는 구간을 Performance 탭에서 확인한 뒤에만 착수할 것.
 
 ---
 
@@ -274,6 +286,10 @@ Point.setCoordinates → geometry.changed()          revision++ / 'change'
   변환은 프레임당 갱신된 로봇에 대해서만 한 번 수행한다.
 - **SSE 구독 해제.** `request.signal`의 abort에서 반드시 unsubscribe해야 한다.
   빠뜨리면 시뮬레이터 구독자가 계속 쌓여 메모리 누수가 난다.
+- **WebGLPoints는 deprecated.** `ol` 10은 `ol/layer/WebGLVector`로 옮기라고 안내하지만
+  **그대로 갈아타면 점이 움직이지 않는다.** WebGLVector의 렌더러는 좌표를
+  `MixedGeometryBatch`에 담고 그 배치를 `changefeature` 이벤트로만 갱신하므로, 1단계의
+  silent 쓰기가 전부 무시된다. 비교 측정 전까지는 deprecated 레이어를 의식적으로 유지한다.
 - **지도 타일.** OSM 공개 타일을 쓴다. 오프라인이면 타일만 비고 벡터 레이어는 정상
   동작한다. 실서비스라면 자체 타일 서버나 벡터 타일로 교체할 지점.
 

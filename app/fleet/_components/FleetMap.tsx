@@ -27,6 +27,35 @@ import { useFleetUi } from '@/store/fleet-store'
 
 import { useFleet } from './FleetProvider'
 
+/*
+ * ══════════════════════════════════════════════════════════════════════════
+ *  최적화 단계별 위치 안내 — README 의 "최적화 로드맵" 절과 짝을 이룬다.
+ *  각 지점에 [1단계]~[4단계] 태그를 달아 뒀으니 태그로 검색해도 된다.
+ * ══════════════════════════════════════════════════════════════════════════
+ *
+ *  [1단계] 이벤트 디스패치 줄이기
+ *      · new VectorSource({ useSpatialIndex: false })    ← effect 1 (지도 초기화)
+ *      · flush() 안, flatCoordinates 인플레이스 쓰기      ← effect 2
+ *      · flush() 끝, source.changed() 딱 1회             ← effect 2
+ *      · lib/geo.ts  mercatorX / mercatorY  (할당 0인 스칼라 변환)
+ *      · tests/ol-invariants.test.ts  (기댄 ol 내부 동작을 테스트로 못 박음)
+ *
+ *  [2단계] rAF 코얼레싱
+ *      · dirty Set + rafId 선언, onFrame 콜백, flush 예약  ← effect 2
+ *
+ *  [3단계] 뷰포트 컬링
+ *      · CULL_MARGIN_PX (바로 아래)
+ *      · flush() 앞부분 뷰 extent 1회 계산                ← effect 2
+ *      · 루프 안 컬링 판정                                ← effect 2
+ *      · moveend → resyncAll (컬링의 유일한 구멍 막기)     ← effect 2
+ *      · lib/geo.ts  padExtent / extentContainsXY
+ *
+ *  [4단계] Canvas → WebGL
+ *      · 갱신 루프 코드 변경 **없음**. 왜 없어도 되는지와 제약은
+ *        effect 2 아래의 ⚑ 블록에 정리했다.
+ *      · WebGLPointsLayer 생성부의 ⚠️ deprecated 함정 주석도 함께 볼 것.
+ */
+
 /**
  * [3단계] 컬링 판정에 쓰는 화면 밖 여유(px).
  *
@@ -78,13 +107,13 @@ export default function FleetMap() {
 
     // ── [1단계] useSpatialIndex: false ─────────────────────────────────────
     //
-    // 이 한 줄은 성능 옵션이 아니라 **아래 프레임 루프의 silent 좌표 쓰기가
-    // 성립하기 위한 전제조건**이다. 순서대로 따라가 보자.
+    // 이 한 줄은 성능 옵션이 아니라 **effect 2 의 silent 좌표 쓰기가 성립하기 위한
+    // 전제조건**이다. 순서대로 따라가 보자.
     //
     //  1. 기본값(true)이면 소스가 RBush 공간 인덱스를 들고, 피처가 change 이벤트를
     //     낼 때마다 해당 항목을 지우고 새 extent 로 다시 넣는다.
     //       → ol/source/Vector.js  handleFeatureChange_()  ...  featuresRtree_.update()
-    //  2. 프레임 루프는 좌표를 silent 로 쓴다. change 이벤트가 안 나간다.
+    //  2. effect 2 는 좌표를 silent 로 쓴다. change 이벤트가 안 나간다.
     //  3. 그러면 인덱스는 **초기 좌표에 영구히 멈춘다.**
     //  4. Canvas 렌더러는 매 프레임 그 인덱스로 그릴 대상을 고른다.
     //       → ol/renderer/canvas/VectorLayer.js  vectorSource.getFeaturesInExtent()
@@ -99,7 +128,7 @@ export default function FleetMap() {
     // 대가: Canvas 렌더러가 화면 밖 피처까지 replay 대상에 넣는다. 그래도 끄는 게
     // 맞다 — 피처 수가 고정(2,000)이고 로딩 전략도 없어서 공간 인덱스로 얻을 게
     // 원래 없었고, 최종 목적지인 WebGLPointsLayer 는 애초에 뷰포트 컬링을 하지
-    // 않는다.
+    // 않는다. 갱신 쪽 컬링은 3단계에서 우리가 직접 한다.
     const source = new VectorSource<Feature<Point>>({
       features,
       wrapX: false,
@@ -135,6 +164,15 @@ export default function FleetMap() {
     // ── WebGL 렌더링 경로 ──
     // 스타일은 GPU 셰이더로 컴파일되는 표현식이다. 그래서 statusCode 를 문자열이
     // 아니라 숫자로 들고 다닌다(lib/types.ts 주석 참고).
+    //
+    // ⚠️ ol 10 에서 WebGLPointsLayer 는 deprecated 이고 ol/layer/WebGLVector 로
+    // 옮기라고 안내한다. **그대로 갈아타면 점이 움직이지 않는다.** WebGLVector 의
+    // 렌더러는 좌표를 MixedGeometryBatch 에 담고, 그 배치를 changefeature
+    // 이벤트로만 갱신한다(ol/renderer/webgl/VectorLayer.js). 좌표 배열 참조를
+    // 다시 읽어주는 WebGLPoints 와 달라서, 우리의 silent 쓰기가 전부 무시된다.
+    // 마이그레이션하려면 피처별 change 이벤트를 되살리거나(= 1단계 되돌리기)
+    // 배치를 직접 무효화하는 경로를 찾아야 한다. 그 비교를 하기 전까지는
+    // deprecated 레이어를 의식적으로 유지한다.
     const webglLayer = new WebGLPointsLayer({
       source,
       visible: false,
@@ -220,7 +258,7 @@ export default function FleetMap() {
 
   // ── 2. 실시간 프레임 → 피처 갱신 ─────────────────────────────────────────
   //
-  // 여기에 최적화 1·2·3단계가 전부 들어 있다. 코드 순서대로 읽으면 된다.
+  // 최적화 1·2·3 단계가 전부 이 effect 안에 있다. 코드 순서대로 읽으면 된다.
   //
   //   [2단계]  dirty Set / rafId 선언
   //   [3단계]  flush() 앞부분 — 뷰 extent 1회 계산
@@ -230,18 +268,31 @@ export default function FleetMap() {
   //   [2단계]  onFrame 콜백 — id 만 적고 rAF 예약
   //   [3단계]  moveend → resyncAll
   //
-  // ── 최적화 전 원본 ──
+  // ── 최적화 전 원본(git show HEAD:...FleetMap.tsx) ──
   //
-  //   fleet.onFrame((changed) => {              // ← SSE 태스크 안에서 전부 처리
-  //     for (const id of changed) {
-  //       const [x, y] = toMercator(robot.lon, robot.lat)
-  //       feature.getGeometry()?.setCoordinates([x, y])
-  //     }
-  //   })
+  //   useEffect(() => {
+  //     const unsubscribe = fleet.onFrame((changed) => {      // ← SSE 태스크 안에서
+  //       const index = featureIndex.current                  //   전부 처리 (2단계 표적)
+  //       for (const id of changed) {                         // ← 화면 밖도 전부 (3단계 표적)
+  //         const feature = index.get(id)
+  //         if (!feature) continue
+  //         const robot = fleet.get(id)
+  //         if (!robot) continue
   //
-  // 아래 코드를 이것과 나란히 놓고 읽으면 각 단계가 무엇을 바꿨는지 보인다.
-  // 바뀐 줄 수는 얼마 안 되고, 대신 **왜 그래도 안전한지**를 아는 데 필요한
-  // 배경지식이 많다. 그 배경이 아래 주석들이다.
+  //         const [x, y] = toMercator(robot.lon, robot.lat)    // ← 배열 할당 2,000회/프레임
+  //         feature.getGeometry()?.setCoordinates([x, y])      // ← 1단계의 주 표적
+  //
+  //         if (feature.get('statusCode') !== robot.statusCode) {
+  //           feature.set('statusCode', robot.statusCode)
+  //         }
+  //       }
+  //     })
+  //     return unsubscribe
+  //   }, [fleet])
+  //
+  // 아래 코드를 이 원본과 나란히 놓고 읽으면 각 단계가 정확히 무엇을 바꿨는지
+  // 보인다. 바뀐 줄 수는 얼마 안 되고, 대신 **왜 그래도 안전한지**를 아는 데
+  // 필요한 배경지식이 많다. 그 배경이 아래 주석들이다.
   useEffect(() => {
     const source = sourceRef.current
     if (!source) return
@@ -295,6 +346,9 @@ export default function FleetMap() {
 
         // ── [1단계] 좌표를 이벤트 없이 쓴다 ────────────────────────────────
         //
+        // before:  const [x, y] = toMercator(robot.lon, robot.lat)
+        //          feature.getGeometry()?.setCoordinates([x, y])
+        //
         // setCoordinates 한 줄이 실제로 하는 일:
         //
         //   Point.setCoordinates()
@@ -307,22 +361,16 @@ export default function FleetMap() {
         //                     ├ source.changed()              소스 revision++ , 'change'
         //                     └ dispatchEvent('changefeature')
         //
-        // 2,000대면 이벤트 6,000회 + RBush 재삽입 2,000회다. 로드맵은 이벤트를
-        // 지목했지만, 실제로 더 무거운 쪽은 ★ 표시한 R-tree 리밸런싱이다.
+        // 2,000대면 이벤트 6,000회 + RBush 재삽입 2,000회다. 로드맵 주석은
+        // 이벤트를 지목했지만, 실제로 더 무거운 쪽은 ★ 표시한 R-tree 리밸런싱이다.
         //
-        // 그런데 이 통보는 애초에 **낭비다.** 렌더러는 다시 그릴 때 소스를 처음부터
-        // 전부 다시 읽는다(Canvas 는 replay group 을 새로 만들고, WebGL 은 버퍼를
-        // 새로 채운다). 증분 갱신 같은 건 없다. 즉 "누가 변했는지" 를 2,000번
-        // 알려줄 필요가 없고 "뭔가 변했다" 를 1번 알리면 결과가 같다.
-        //
-        // 그래서 Point 가 좌표를 담고 있는 내부 배열(flatCoordinates)을 직접
-        // 덮어쓴다. setCoordinates 를 우회하므로 위 연쇄가 전부 일어나지 않는다.
-        // 대신 루프가 끝난 뒤 source.changed() 를 딱 한 번 부른다(아래).
+        // after: Point 가 좌표를 담고 있는 내부 배열(flatCoordinates)을 직접 덮어쓴다.
+        // setCoordinates 를 우회하므로 위 연쇄가 전부 일어나지 않는다. 대신 루프가
+        // 끝난 뒤 source.changed() 를 딱 한 번 부른다(아래).
         //
         // getFlatCoordinates() 가 **복사본이 아니라 내부 배열 그 자체**를 돌려준다는
-        // 점에 기대고 있다. 공개 API 로 보장된 동작이 아니라서
-        // tests/ol-invariants.test.ts 가 이 가정을 못 박는다. 여기가 깨지면 지도는
-        // 에러 없이 그냥 얼어붙는다.
+        // 점에 기대고 있다. 공개 API 로 보장된 동작이 아니라서 tests/ol-invariants.test.ts
+        // 가 이 가정을 못 박는다. 여기가 깨지면 지도는 에러 없이 그냥 얼어붙는다.
         //
         // mercatorX/Y 를 스칼라로 쓰는 것도 같은 결의 이유다. toMercator 는 호출마다
         // 길이 2 배열을 새로 만들어 초당 20,000개의 단명 객체를 남긴다.
@@ -359,11 +407,16 @@ export default function FleetMap() {
         flat[0] = x
         flat[1] = y
 
-        // ── [1단계] statusCode 는 일부러 silent 로 쓰지 않는다 ──────────────
+        // ── [1단계·4단계] statusCode 는 일부러 silent 로 쓰지 않는다 ────────
         //
-        // 좌표와 달리 여기서는 feature.set() 을 그대로 쓴다. 상태 전환은 프레임당
-        // 기껏 몇 대라 이벤트 몇 번이 문제가 안 된다. 그리고 4단계에서 밝혀지듯
-        // WebGL 경로가 이 이벤트를 필요로 한다.
+        // 좌표와 달리 여기서는 feature.set() 을 그대로 쓴다. 이유가 두 개다.
+        //
+        //  1. 싸다. 상태 전환은 프레임당 기껏 몇 대라 이벤트 몇 번이 문제가 안 된다.
+        //  2. **WebGL 경로가 이 이벤트를 필요로 한다.** WebGLPointsLayerRenderer 는
+        //     좌표는 배열 참조로 다시 읽지만, 속성은 changefeature 이벤트를 받을 때만
+        //     캐시를 갱신한다(handleSourceFeatureChanged_ 가 item.properties 를 다시
+        //     읽는다). 여기까지 silent 로 바꾸면 WebGL 모드에서 **위치는 움직이는데
+        //     색만 안 바뀌는** 버그가 된다. 4단계 ⚑ 블록 참고.
         //
         // if 로 감싼 것도 의미가 있다. 값이 같을 때 set() 을 부르면 OL 이 그대로
         // 이벤트를 흘려서, 안 변한 로봇 2,000대가 매 프레임 이벤트를 낸다.
@@ -374,11 +427,11 @@ export default function FleetMap() {
 
       dirty.clear()
 
-      // ── [1단계] 프레임당 딱 한 번 ────────────────────────────────────────
+      // ── [1단계] 프레임당 딱 한 번 ──────────────────────────────────────────
       //
       // 여기서 소스 revision 이 1 오르고, 두 렌더러가 각자 그걸 보고 다시 그린다.
       //   Canvas : 다음 렌더에서 replay group 을 새로 만든다.
-      //   WebGL  : prepareFrameInternal 이 sourceRevision_ 비교로 버퍼를 다시 채운다.
+      //   WebGL  : prepareFrameInternal 이 sourceRevision_ 비교로 rebuildBuffers_ 를 돈다.
       //
       // 이 한 줄이 위에서 없앤 2,000번의 source.changed() 를 대신한다. 반대로
       // 이 줄을 빼먹으면 좌표는 조용히 바뀌었는데 다시 그릴 이유가 없어서
@@ -388,13 +441,13 @@ export default function FleetMap() {
 
     // ── [2단계] SSE 콜백은 최대한 짧게 ──────────────────────────────────────
     //
-    // 1단계까지는 이 콜백 안에서 2,000대의 좌표 변환과 쓰기를 다 했다.
+    // before 에서는 이 콜백 안에서 2,000대의 좌표 변환과 쓰기를 다 했다.
     // 지금은 id 를 Set 에 담고 rAF 한 번 예약하는 것으로 끝난다.
     //
     // 10Hz(SSE) vs 60Hz(화면)이라 평상시엔 프레임이 겹치지 않는다. 그래서 이
     // 단계의 FPS 이득은 **거의 0으로 측정될 것이다.** 값을 하는 구간은 따로 있다.
     //
-    //  - 백그라운드 탭: rAF 가 멈춘다 → OL 작업이 0이 된다. 1단계까지는 안 보이는
+    //  - 백그라운드 탭: rAF 가 멈춘다 → OL 작업이 0이 된다. before 는 안 보이는
     //    탭에서도 계속 피처를 갱신하고 렌더를 요청했다. 복귀하면 쌓인 dirty 가
     //    한 번에 반영된다(Set 이라 크기는 플릿 대수로 상한이 걸린다).
     //  - 메인 스레드가 한 번 밀려 프레임이 몰려 들어올 때(재연결 직후 등)
@@ -426,9 +479,9 @@ export default function FleetMap() {
     // 사람 조작 빈도의 2,000회 쓰기라 비용이 없다.
     //
     // moveend 를 쓰는 이유: 팬 중(pointerdrag)마다 돌면 드래그가 무거워진다.
-    // 어차피 드래그 중에는 위 판정이 새 extent 를 매 프레임 다시 계산하므로 화면에
-    // 들어온 로봇은 이미 정상 갱신되고 있다. 멈춘 로봇만 남는데, 그건 손을 뗀 뒤
-    // 한 번 씻어도 늦지 않다.
+    // 어차피 드래그 중에는 3단계 판정이 새 extent 를 매 프레임 다시 계산하므로
+    // 화면에 들어온 로봇은 이미 정상 갱신되고 있다. 멈춘 로봇만 남는데, 그건
+    // 손을 뗀 뒤 한 번 씻어도 늦지 않다.
     const resyncAll = () => {
       for (const id of featureIndex.current.keys()) dirty.add(id)
       if (rafId === 0) rafId = requestAnimationFrame(flush)
@@ -445,20 +498,65 @@ export default function FleetMap() {
   }, [fleet])
 
   /*
-   * ⚑ 최적화 착수 지점 (여기서부터가 이 프로젝트의 본론)
+   * ══════════════════════════════════════════════════════════════════════
+   *  ⚑ [4단계] Canvas → WebGL 전환 (우상단 토글)
+   * ══════════════════════════════════════════════════════════════════════
    *
-   * 개선 여지가 순서대로 이렇다. 완료한 단계는 ✅ 로 표시한다.
+   * **이 단계에는 갱신 루프 코드 변경이 없다.** 위 effect 2 를 다시 봐도 renderMode
+   * 분기가 한 줄도 없다. 그게 1~3단계의 성과다 — 두 레이어가 같은 VectorSource 를
+   * 공유하므로, 갱신 경로는 "소스" 까지만 알면 되고 렌더러를 몰라도 된다.
    *
-   *  1) ✅ 완료 — 이벤트 디스패치 줄이기. 위 [1단계] 주석 참고.
+   * 하지만 "분기가 없다" 가 "아무거나 해도 된다" 는 뜻은 절대 아니다. silent 좌표
+   * 쓰기가 WebGL 에서도 통하는 이유는 아주 구체적이고, 조금만 달랐으면 안 통했다.
    *
-   *  2) ✅ 완료 — rAF 코얼레싱. 위 [2단계] 주석 참고.
+   * ── 왜 통하는가 (좌표) ──
    *
-   *  3) ✅ 완료 — 뷰포트 컬링. 위 [3단계] 주석 참고.
+   *   ol/renderer/webgl/PointsLayer.js 를 열어 보면 렌더러가 피처별 캐시를 둔다.
    *
-   *  4) Canvas → WebGL 전환 (우상단 토글). 여기가 가장 큰 폭의 개선이다.
+   *     this.featureCache_[uid] = {
+   *       feature,
+   *       properties:      feature.getProperties(),
+   *       flatCoordinates: geometry.getFlatCoordinates(),   // ← 배열을 "참조로" 보관
+   *     }
    *
-   * 각 단계마다 StatsOverlay 의 FPS 를 기록해 README 의 표를 채운다.
-   * 한 번에 다 고치지 말고 단계별 커밋으로 남기면 그 자체가 포트폴리오가 된다.
+   *   그리고 rebuildBuffers_() 가 소스 revision 이 오를 때마다 그 참조를 다시 읽어
+   *   Float32Array 를 채운다.
+   *
+   *     tmpCoords[0] = featureCache.flatCoordinates[0]
+   *     tmpCoords[1] = featureCache.flatCoordinates[1]
+   *
+   *   우리가 인플레이스로 덮어쓴 값이 바로 이 배열이다. 그래서 이벤트를 하나도
+   *   안 보내도 다음 rebuild 에 그대로 실린다. rebuild 를 촉발하는 건 flush() 끝의
+   *   source.changed() 한 줄이다.
+   *
+   * ── 왜 statusCode 는 다른가 (속성) ──
+   *
+   *   같은 캐시의 properties 는 changefeature 이벤트를 받을 때만 다시 읽힌다
+   *   (handleSourceFeatureChanged_). 좌표처럼 참조를 들고 있는 게 아니라 그 시점의
+   *   스냅샷이다. 그래서 effect 2 는 좌표만 silent 로 쓰고 statusCode 는 일부러
+   *   feature.set() 으로 쓴다. 이 비대칭을 모르고 둘 다 silent 로 바꾸면
+   *   **위치는 움직이는데 색만 안 바뀌는** 버그가 난다.
+   *
+   * ── 알아둘 제약 세 가지 ──
+   *
+   *  1) 팬·줌 **중**에는 점이 멈춘다. prepareFrameInternal 이 viewHints 의
+   *     ANIMATING / INTERACTING 동안 rebuild 를 건너뛴다. followSelected 의
+   *     animate(400ms) 구간도 여기 해당한다. Canvas 에는 없는 현상이라, 토글을
+   *     오가며 드래그해 보면 차이가 바로 보인다.
+   *  2) WebGLPoints 에는 뷰포트 컬링이 없다. rebuildBuffers_ 는 featureCache_ 를
+   *     전부 돌며 화면 밖 피처까지 다시 업로드한다. 즉 3단계가 아끼는 건 CPU 쪽
+   *     좌표 변환·쓰기뿐이고, GPU 업로드량은 그대로다.
+   *  3) 히트 디텍션이 프레임당 렌더 패스를 하나 더 쓴다(점당 float 3개 추가 +
+   *     hit render target 재렌더). WebGL FPS 가 기대만 못하면 여기가 첫 손질
+   *     지점이다 — 단 클릭 선택을 포기해야 한다(disableHitDetection: true).
+   *
+   * ── 측정 ──
+   *
+   *   토글은 데이터를 건드리지 않고 렌더 경로만 바꾼다. 숨긴 레이어는 OL 이
+   *   prepareFrame 자체를 건너뛰므로 비용이 0이고, 그래서 A/B 가 공정하다.
+   *   숫자는 우하단 StatsOverlay 에서 읽어 README 표에 남긴다.
+   *   ⚠️ GPU 가속이 꺼진 브라우저에선 WebGL 이 소프트웨어 렌더링으로 떨어져
+   *   Canvas 보다 느리게 나온다. chrome://gpu 를 먼저 확인할 것.
    */
 
   // ── 3. 렌더 모드 토글 ────────────────────────────────────────────────────
