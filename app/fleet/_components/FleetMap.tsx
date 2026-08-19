@@ -200,22 +200,52 @@ export default function FleetMap() {
 
   // ── 2. 실시간 프레임 → 피처 갱신 ─────────────────────────────────────────
   //
+  // 여기에 최적화 1·2단계가 들어 있다. 코드 순서대로 읽으면 된다.
+  //
+  //   [2단계]  dirty Set / rafId 선언
+  //   [1단계]  flush() 루프 안 — flatCoordinates 인플레이스 쓰기
+  //   [1단계]  flush() 끝 — source.changed() 1회
+  //   [2단계]  onFrame 콜백 — id 만 적고 rAF 예약
+  //
   // ── 최적화 전 원본 ──
   //
-  //   const [x, y] = toMercator(robot.lon, robot.lat)
-  //   feature.getGeometry()?.setCoordinates([x, y])
+  //   fleet.onFrame((changed) => {              // ← SSE 태스크 안에서 전부 처리
+  //     for (const id of changed) {
+  //       const [x, y] = toMercator(robot.lon, robot.lat)
+  //       feature.getGeometry()?.setCoordinates([x, y])
+  //     }
+  //   })
   //
-  // 아래 코드를 이것과 나란히 놓고 읽으면 1단계가 무엇을 바꿨는지 보인다.
+  // 아래 코드를 이것과 나란히 놓고 읽으면 각 단계가 무엇을 바꿨는지 보인다.
   // 바뀐 줄 수는 얼마 안 되고, 대신 **왜 그래도 안전한지**를 아는 데 필요한
-  // 배경지식이 많다. 그 배경이 아래 주석이다.
+  // 배경지식이 많다. 그 배경이 아래 주석들이다.
   useEffect(() => {
     const source = sourceRef.current
     if (!source) return
 
-    const unsubscribe = fleet.onFrame((changed) => {
+    // ── [2단계] 코얼레싱 상태 ──────────────────────────────────────────────
+    //
+    // dirty 에는 **id 만** 넣는다. 좌표값을 큐에 쌓지 않는 게 핵심이다.
+    //
+    //   값을 쌓으면      : 같은 로봇이 한 화면 프레임에 3번 오면 3개가 쌓이고,
+    //                      플러시에서 3번 다 쓰거나 마지막 것만 골라내야 한다.
+    //   id 만 적으면     : Set 이 알아서 합쳐주고, 플러시 시점에 fleet 에서 최신값을
+    //                      한 번 읽으면 된다. 좌표 변환도 쓰기도 정확히 1회.
+    //
+    // 즉 "무엇이 변했는지" 만 기록하고 "무슨 값인지" 는 쓰는 순간에 조회한다.
+    // 실시간 렌더 루프의 일반적인 패턴이다(dirty flag + pull).
+    const dirty = new Set<string>()
+
+    // 0 = 예약 없음. rAF 핸들은 항상 0보다 크므로 센티널로 0을 쓸 수 있다.
+    let rafId = 0
+
+    const flush = () => {
+      rafId = 0
+      if (dirty.size === 0) return
+
       const index = featureIndex.current
 
-      for (const id of changed) {
+      for (const id of dirty) {
         const feature = index.get(id)
         if (!feature) continue
         const robot = fleet.get(id)
@@ -272,6 +302,8 @@ export default function FleetMap() {
         }
       }
 
+      dirty.clear()
+
       // ── [1단계] 프레임당 딱 한 번 ────────────────────────────────────────
       //
       // 여기서 소스 revision 이 1 오르고, 두 렌더러가 각자 그걸 보고 다시 그린다.
@@ -282,8 +314,38 @@ export default function FleetMap() {
       // 이 줄을 빼먹으면 좌표는 조용히 바뀌었는데 다시 그릴 이유가 없어서
       // **지도가 정지 화면이 된다** — silent 갱신에서 가장 흔한 실수다.
       source.changed()
+    }
+
+    // ── [2단계] SSE 콜백은 최대한 짧게 ──────────────────────────────────────
+    //
+    // 1단계까지는 이 콜백 안에서 2,000대의 좌표 변환과 쓰기를 다 했다.
+    // 지금은 id 를 Set 에 담고 rAF 한 번 예약하는 것으로 끝난다.
+    //
+    // 10Hz(SSE) vs 60Hz(화면)이라 평상시엔 프레임이 겹치지 않는다. 그래서 이
+    // 단계의 FPS 이득은 **거의 0으로 측정될 것이다.** 값을 하는 구간은 따로 있다.
+    //
+    //  - 백그라운드 탭: rAF 가 멈춘다 → OL 작업이 0이 된다. 1단계까지는 안 보이는
+    //    탭에서도 계속 피처를 갱신하고 렌더를 요청했다. 복귀하면 쌓인 dirty 가
+    //    한 번에 반영된다(Set 이라 크기는 플릿 대수로 상한이 걸린다).
+    //  - 메인 스레드가 한 번 밀려 프레임이 몰려 들어올 때(재연결 직후 등)
+    //    몰린 프레임들이 한 번의 쓰기로 접힌다.
+    //  - FLEET_TICK_MS 를 16 아래로 내리면 곧바로 배수만큼 이득이 된다.
+    //  - 상시 이득: 무거운 쓰기가 네트워크 콜백에서 페인트 직전 프레임 콜백으로
+    //    옮겨간다. 긴 태스크가 입력 처리와 겹칠 확률이 줄어 체감 스터터가 준다.
+    //
+    // 대가는 최대 한 화면 프레임(~16ms)의 표시 지연. 10Hz 데이터엔 무의미하다.
+    const unsubscribe = fleet.onFrame((changed) => {
+      for (const id of changed) dirty.add(id)
+      // 이미 예약돼 있으면 다시 예약하지 않는다. 이 한 줄이 코얼레싱의 전부다.
+      if (rafId === 0) rafId = requestAnimationFrame(flush)
     })
-    return unsubscribe
+
+    return () => {
+      unsubscribe()
+      // 예약된 플러시가 남아 있으면 취소한다. 안 하면 언마운트된 뒤 dispose 된
+      // 소스에 changed() 를 부른다.
+      if (rafId !== 0) cancelAnimationFrame(rafId)
+    }
   }, [fleet])
 
   /*
@@ -293,8 +355,7 @@ export default function FleetMap() {
    *
    *  1) ✅ 완료 — 이벤트 디스패치 줄이기. 위 [1단계] 주석 참고.
    *
-   *  2) SSE 프레임 주기(10Hz)와 화면 주사율(60Hz)이 어긋난다.
-   *     → requestAnimationFrame 으로 코얼레싱해 프레임당 정확히 한 번만 그린다.
+   *  2) ✅ 완료 — rAF 코얼레싱. 위 [2단계] 주석 참고.
    *
    *  3) 화면 밖 로봇도 전부 갱신하고 있다.
    *     → map.getView().calculateExtent() 로 뷰포트 컬링. 줌 아웃 상태에서는
