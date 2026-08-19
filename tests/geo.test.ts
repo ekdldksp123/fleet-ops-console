@@ -4,9 +4,11 @@ import {
   MAX_LATITUDE,
   clampLatitude,
   haversine,
+  extentContainsXY,
   lonLatExtent,
   mercatorX,
   mercatorY,
+  padExtent,
   toLonLat,
   toMercator,
   toMercatorExtent,
@@ -122,5 +124,36 @@ describe('[1단계] 실시간 루프용 스칼라 변환', () => {
       expect(mercatorX(lon)).toBe(x)
       expect(mercatorY(lat)).toBe(y)
     }
+  })
+})
+
+/**
+ * 컬링 판정은 틀리면 "로봇이 조용히 사라진다"는 방식으로 실패한다.
+ * 특히 경계값이 위험해서 포함/제외를 명시적으로 못 박는다.
+ */
+describe('[3단계] 뷰포트 컬링 헬퍼', () => {
+  const extent = [0, 0, 100, 50] as const
+
+  it('extent 를 사방으로 넓힌다', () => {
+    expect(padExtent(extent, 10)).toEqual([-10, -10, 110, 60])
+  })
+
+  it('음수 margin 으로 좁힐 수도 있다', () => {
+    expect(padExtent(extent, -10)).toEqual([10, 10, 90, 40])
+  })
+
+  it('안쪽 점은 포함한다', () => {
+    expect(extentContainsXY(extent, 50, 25)).toBe(true)
+  })
+
+  it('경계 위의 점은 포함한다', () => {
+    // 경계를 제외하면 화면 끝의 로봇이 매 프레임 컬링/갱신을 왕복하며 떨린다.
+    expect(extentContainsXY(extent, 0, 0)).toBe(true)
+    expect(extentContainsXY(extent, 100, 50)).toBe(true)
+  })
+
+  it('축 하나만 벗어나도 제외한다', () => {
+    expect(extentContainsXY(extent, 101, 25)).toBe(false)
+    expect(extentContainsXY(extent, 50, -1)).toBe(false)
   })
 })

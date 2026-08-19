@@ -13,11 +13,31 @@ import OSM from 'ol/source/OSM'
 import VectorSource from 'ol/source/Vector'
 import { Circle as CircleStyle, Fill, Stroke, Style } from 'ol/style'
 
-import { lonLatExtent, mercatorX, mercatorY, toMercator, toMercatorExtent } from '@/lib/geo'
+import {
+  extentContainsXY,
+  lonLatExtent,
+  mercatorX,
+  mercatorY,
+  padExtent,
+  toMercator,
+  toMercatorExtent,
+} from '@/lib/geo'
 import { STATUS_COLORS, type StatusCode } from '@/lib/types'
 import { useFleetUi } from '@/store/fleet-store'
 
 import { useFleet } from './FleetProvider'
+
+/**
+ * [3단계] 컬링 판정에 쓰는 화면 밖 여유(px).
+ *
+ * 0으로 두면 화면 경계에 딱 걸친 로봇이 프레임마다 컬링/갱신을 왕복하며 떨린다.
+ * VectorLayer 의 기본 renderBuffer(100px)보다 넉넉하게 잡아, "렌더러는 그리는데
+ * 우리는 갱신을 건너뛴 로봇" 이 생기지 않게 한다.
+ *
+ * 판정 자체는 lib/geo.ts 의 순수 함수로 빼서 테스트로 덮었다. 경계에서 틀리면
+ * 로봇이 조용히 사라지는 방식으로 실패하기 때문이다.
+ */
+const CULL_MARGIN_PX = 128
 
 /**
  * OpenLayers 관제 지도.
@@ -200,12 +220,15 @@ export default function FleetMap() {
 
   // ── 2. 실시간 프레임 → 피처 갱신 ─────────────────────────────────────────
   //
-  // 여기에 최적화 1·2단계가 들어 있다. 코드 순서대로 읽으면 된다.
+  // 여기에 최적화 1·2·3단계가 전부 들어 있다. 코드 순서대로 읽으면 된다.
   //
   //   [2단계]  dirty Set / rafId 선언
+  //   [3단계]  flush() 앞부분 — 뷰 extent 1회 계산
   //   [1단계]  flush() 루프 안 — flatCoordinates 인플레이스 쓰기
+  //   [3단계]  flush() 루프 안 — 컬링 판정
   //   [1단계]  flush() 끝 — source.changed() 1회
   //   [2단계]  onFrame 콜백 — id 만 적고 rAF 예약
+  //   [3단계]  moveend → resyncAll
   //
   // ── 최적화 전 원본 ──
   //
@@ -244,6 +267,25 @@ export default function FleetMap() {
       if (dirty.size === 0) return
 
       const index = featureIndex.current
+
+      // ── [3단계] 뷰 extent 를 프레임당 한 번만 계산 ────────────────────────
+      //
+      // 로봇마다 calculateExtent() 를 부르면 컬링으로 아낀 것보다 더 쓴다.
+      // 루프 밖에서 한 번 계산해 두고 2,000번 재사용한다.
+      //
+      // resolution 은 "지도 단위(m) / 픽셀" 이다. 그래서 픽셀 여유를 지도 단위로
+      // 바꿀 때 곱해 준다. 줌 레벨이 달라지면 같은 128px 이 다른 미터 값이 된다.
+      //
+      // 첫 렌더 전에는 resolution 이 undefined 다. 그때는 viewExtent 를 null 로
+      // 두고 **컬링을 아예 하지 않는다** — 확신이 없을 때는 전부 갱신하는 쪽이
+      // 안전하다. 반대로 하면 초기 화면이 빈 지도로 보인다.
+      const view = mapRef.current?.getView()
+      const size = mapRef.current?.getSize()
+      const resolution = view?.getResolution()
+      const viewExtent =
+        view && size && resolution
+          ? padExtent(view.calculateExtent(size), resolution * CULL_MARGIN_PX)
+          : null
 
       for (const id of dirty) {
         const feature = index.get(id)
@@ -286,8 +328,36 @@ export default function FleetMap() {
         // 길이 2 배열을 새로 만들어 초당 20,000개의 단명 객체를 남긴다.
         const flat = feature.getGeometry()?.getFlatCoordinates()
         if (!flat) continue
-        flat[0] = mercatorX(robot.lon)
-        flat[1] = mercatorY(robot.lat)
+
+        const x = mercatorX(robot.lon)
+        const y = mercatorY(robot.lat)
+
+        // ── [3단계] 컬링 판정 ─────────────────────────────────────────────
+        //
+        // 새 위치와 **직전에 쓴 위치**(= flat 에 아직 남아 있는 값)를 OR 로 본다.
+        // 새 위치만 보면 이런 버그가 난다:
+        //
+        //   화면 안에 있던 로봇이 밖으로 나간다
+        //     → 새 위치가 밖이라 갱신을 건너뛴다
+        //     → flat 에는 마지막으로 쓴 "화면 안" 좌표가 남는다
+        //     → 렌더러는 그 좌표를 계속 그린다
+        //     → **로봇이 화면 경계에 얼어붙는다**
+        //
+        // 직전 위치도 함께 보면, 나가는 순간의 한 프레임은 반드시 써지고 그 값이
+        // 화면 밖이 되어 다음 프레임부터 정상적으로 컬링된다.
+        //
+        // 반대 방향(밖 → 안)은 새 위치 검사가 잡아준다. 그래서 두 조건의 OR 로
+        // 진입·이탈이 모두 덮인다.
+        if (
+          viewExtent &&
+          !extentContainsXY(viewExtent, x, y) &&
+          !extentContainsXY(viewExtent, flat[0], flat[1])
+        ) {
+          continue
+        }
+
+        flat[0] = x
+        flat[1] = y
 
         // ── [1단계] statusCode 는 일부러 silent 로 쓰지 않는다 ──────────────
         //
@@ -340,8 +410,34 @@ export default function FleetMap() {
       if (rafId === 0) rafId = requestAnimationFrame(flush)
     })
 
+    // ── [3단계] 컬링의 유일한 구멍을 막는다 ─────────────────────────────────
+    //
+    // 컬링은 "화면 밖 로봇의 갱신을 건너뛴다" 인데, 건너뛴 좌표는 언젠가 다시
+    // 써져야 한다. 보통은 로봇이 계속 움직이니 다음 델타에 다시 등장해서 저절로
+    // 해결된다. 딱 한 경우가 안 된다.
+    //
+    //   화면 밖에서 갱신을 건너뛴 로봇이 그 자리에 멈춰 선다(대기·충전 전환)
+    //     → 더 이상 값이 안 변하니 델타에 등장하지 않는다
+    //     → 사용자가 그쪽으로 팬한다
+    //     → 옛 좌표가 그려진 채 남는다. 영구히.
+    //
+    // 로봇이 아니라 **뷰가 움직여서** 생기는 얼룩이라 데이터 쪽 이벤트로는 절대
+    // 안 씻긴다. 그래서 뷰 이벤트로 씻어낸다 — 팬·줌이 끝나면 전체를 다시 쓴다.
+    // 사람 조작 빈도의 2,000회 쓰기라 비용이 없다.
+    //
+    // moveend 를 쓰는 이유: 팬 중(pointerdrag)마다 돌면 드래그가 무거워진다.
+    // 어차피 드래그 중에는 위 판정이 새 extent 를 매 프레임 다시 계산하므로 화면에
+    // 들어온 로봇은 이미 정상 갱신되고 있다. 멈춘 로봇만 남는데, 그건 손을 뗀 뒤
+    // 한 번 씻어도 늦지 않다.
+    const resyncAll = () => {
+      for (const id of featureIndex.current.keys()) dirty.add(id)
+      if (rafId === 0) rafId = requestAnimationFrame(flush)
+    }
+    mapRef.current?.on('moveend', resyncAll)
+
     return () => {
       unsubscribe()
+      mapRef.current?.un('moveend', resyncAll)
       // 예약된 플러시가 남아 있으면 취소한다. 안 하면 언마운트된 뒤 dispose 된
       // 소스에 changed() 를 부른다.
       if (rafId !== 0) cancelAnimationFrame(rafId)
@@ -357,9 +453,7 @@ export default function FleetMap() {
    *
    *  2) ✅ 완료 — rAF 코얼레싱. 위 [2단계] 주석 참고.
    *
-   *  3) 화면 밖 로봇도 전부 갱신하고 있다.
-   *     → map.getView().calculateExtent() 로 뷰포트 컬링. 줌 아웃 상태에서는
-   *       효과가 없지만 줌 인 상태에서는 갱신량이 크게 준다.
+   *  3) ✅ 완료 — 뷰포트 컬링. 위 [3단계] 주석 참고.
    *
    *  4) Canvas → WebGL 전환 (우상단 토글). 여기가 가장 큰 폭의 개선이다.
    *

@@ -108,6 +108,33 @@ export function toMercatorExtent(e: Extent): [number, number, number, number] {
   return [minX, minY, maxX, maxY]
 }
 
+/*
+ * ── [3단계] 뷰포트 컬링용 헬퍼 ──
+ *
+ * 아래 두 함수는 OpenLayers 의 extent 표현([minX, minY, maxX, maxY])을 그대로
+ * 받는다. 위의 `Extent` 인터페이스와 달리 경위도가 아니라 투영 좌표계 값이고,
+ * `View#calculateExtent()` 의 반환값을 그대로 넘길 수 있게 배열로 받는다.
+ *
+ * ol/extent 의 `buffer`·`containsXY` 와 하는 일이 같다. 그런데도 여기 두는 이유는
+ * 이 파일의 존재 이유와 같다 — 컬링 판정은 "이 로봇을 갱신하지 않겠다" 는 결정
+ * **그 자체**라서, 경계에서 한 칸 틀리면 로봇이 조용히 사라지거나 화면 끝에서
+ * 떨린다. 지도를 띄우지 않고 값으로 못 박을 수 있어야 하는 종류의 코드다.
+ * → tests/geo.test.ts 의 '[3단계] 뷰포트 컬링 헬퍼' describe
+ */
+
+/** extent 를 사방으로 margin 만큼 넓힌다. margin 은 투영 좌표계 단위(m). */
+export function padExtent(
+  extent: readonly number[],
+  margin: number,
+): [number, number, number, number] {
+  return [extent[0] - margin, extent[1] - margin, extent[2] + margin, extent[3] + margin]
+}
+
+/** 점이 extent 안(경계 포함)에 있는지. */
+export function extentContainsXY(extent: readonly number[], x: number, y: number): boolean {
+  return x >= extent[0] && x <= extent[2] && y >= extent[1] && y <= extent[3]
+}
+
 /** 두 경위도 지점 사이의 대권 거리 (m) */
 export function haversine(a: LonLat, b: LonLat): number {
   const dLat = (b[1] - a[1]) * DEG_TO_RAD
