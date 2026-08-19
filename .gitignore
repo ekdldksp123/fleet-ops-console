@@ -14,3 +14,10 @@ next-env.d.ts.bak
 /playwright-report/
 /blob-report/
 /playwright/.cache/
+
+# Yarn (nodeLinker: node-modules) — 설치 산출물만 무시하고 lock 은 커밋한다
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+.pnp.*
