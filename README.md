@@ -143,7 +143,7 @@ FPS·최저 FPS·최장 프레임·수신 지연을 읽는다.
 > (SwiftShader)으로 떨어져 Canvas보다 **느리게** 나온다. 반드시 실제 GPU가 있는
 > 브라우저에서 측정할 것. `chrome://gpu`에서 하드웨어 가속을 먼저 확인한다.
 
-### 결과 표 (직접 채울 것)
+### 결과 표 — 렌더 경로 (직접 채울 것)
 
 | 로봇 대수 | Canvas 평균 FPS | Canvas 최저 | WebGL 평균 FPS | WebGL 최저 | 개선 |
 | --- | --- | --- | --- | --- | --- |
@@ -151,6 +151,27 @@ FPS·최저 FPS·최장 프레임·수신 지연을 읽는다.
 | 1,000 | | | | | |
 | 2,000 | | | | | |
 | 5,000 | | | | | |
+
+### 결과 표 — 최적화 단계
+
+최적화 단계는 **단계별 커밋을 하나씩 체크아웃해** 측정한다.
+
+```bash
+git log --oneline            # 단계별 커밋 확인
+git checkout <커밋>          # 해당 단계 상태로 이동
+FLEET_SIZE=20000 yarn dev    # 측정
+```
+
+> ⚠️ **부하를 충분히 올려야 차이가 보인다.** 2,000대와 5,000대에서는 최적화 전에도
+> 60 FPS가 나온다. 아낀 시간이 16.6ms 프레임 예산 안에 묻히기 때문이다. 병목이
+> 아닌 곳을 최적화하면 측정에 아무것도 안 나온다 — 그 사실 자체가 배울 점이다.
+
+| 단계 | 평균 FPS | 최저 FPS | 최장 프레임 |
+| --- | --- | --- | --- |
+| 0. 소박한 루프 (before) | | | |
+| 1. silent 갱신 + changed() 1회 | | | |
+| 2. + rAF 코얼레싱 | | | |
+| 3. + 뷰포트 컬링 (줌인) | | | |
 
 ---
 
@@ -160,9 +181,7 @@ FPS·최저 FPS·최장 프레임·수신 지연을 읽는다.
 "before"다. 아래를 순서대로 적용하고 **단계마다 커밋과 측정치를 남기면** 그 자체가
 포트폴리오가 된다.
 
-1. **이벤트 디스패치 줄이기** — `setCoordinates`는 피처마다 change 이벤트를 낸다.
-   프레임당 2,000회다. geometry를 silent로 갱신하고 프레임 끝에 `source.changed()`를
-   한 번만 호출하면 2,000 → 1이 된다.
+1. **이벤트 디스패치 줄이기** ✅ — 아래 "1단계" 절 참고.
 2. **rAF 코얼레싱** — SSE 프레임(10Hz)과 화면 주사율(60Hz)이 어긋난다.
    `requestAnimationFrame`으로 묶어 프레임당 정확히 한 번만 그린다.
 3. **뷰포트 컬링** — `map.getView().calculateExtent()`로 화면 밖 로봇의 갱신을 건너뛴다.
@@ -170,6 +189,43 @@ FPS·최저 FPS·최장 프레임·수신 지연을 읽는다.
 4. **Canvas → WebGL 전환** — 가장 큰 폭의 개선.
 5. (선택) **Web Worker에서 델타 파싱** — JSON.parse가 메인 스레드를 막는 구간을
    Performance 탭에서 확인한 뒤에만 착수할 것.
+
+### 1단계 — 이벤트 디스패치 줄이기 ✅
+
+`setCoordinates` 한 번이 실제로 하는 일은 좌표 대입이 아니다.
+
+```
+Point.setCoordinates → geometry.changed()          revision++ / 'change'
+  → Feature.handleGeometryChange_ → feature.changed()   'change'
+    → VectorSource.handleFeatureChange_
+        ├ geometry.getExtent()
+        ├ featuresRtree_.update(extent, feature)   ← RBush remove + insert
+        ├ source.changed()
+        └ dispatchEvent('changefeature')
+```
+
+프레임당 2,000대면 이벤트 6,000회 + RBush 재삽입 2,000회다. 주석이 지목한
+이벤트보다 **R-tree 리밸런싱이 더 무겁다.**
+
+그런데 이 통보는 애초에 낭비다. **렌더러는 다시 그릴 때 소스를 처음부터 전부 다시
+읽는다** — Canvas는 replay group을 새로 만들고, WebGL은 버퍼를 새로 채운다. 증분
+갱신 같은 건 없다. "누가 변했는지"를 2,000번 알릴 필요가 없고 "뭔가 변했다"를 1번
+알리면 결과가 같다.
+
+→ `Point`의 내부 `flatCoordinates`를 인플레이스로 덮어쓰고, 루프가 끝난 뒤
+`source.changed()`를 한 번만 호출한다.
+
+**전제조건이 두 개 있고, 둘 다 빠뜨리면 조용히 깨진다.**
+
+- `useSpatialIndex: false`가 **필수**다. 기본값이면 R-tree가 옛 좌표에 멈추고,
+  Canvas 렌더러는 매 프레임 `getFeaturesInExtent()`로 그릴 대상을 고르기 때문에
+  줌인 상태에서 로봇이 사라지거나 옛 자리에 남는다. 이 앱은 피처 수가 고정이고
+  로딩 전략도 없어서 공간 인덱스로 얻을 게 없다.
+- `flatCoordinates` 배열 아이덴티티가 유지된다는 가정에 기대고 있다. 공개 API가
+  아니므로 `tests/ol-invariants.test.ts`가 `ol` 업그레이드 시 깨지도록 못 박았다.
+- `useGeographic()`을 켜면 안 된다. 사용자 투영이 설정되면 렌더러가
+  `simplifyTransformed`에서 geometry를 **clone해 revision으로 메모이즈**하므로,
+  revision이 안 오르는 silent 쓰기는 영원히 무시된다.
 
 ---
 

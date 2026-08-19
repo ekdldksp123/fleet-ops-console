@@ -28,12 +28,33 @@ export function clampLatitude(lat: number): number {
   return lat
 }
 
+/**
+ * [1단계] EPSG:4326 → EPSG:3857 의 x 성분만.
+ *
+ * 스칼라로 쪼개 둔 이유는 순전히 실시간 루프 때문이다. `toMercator` 는 호출마다
+ * 길이 2 배열을 새로 만드는데, 2,000대 × 10Hz 면 초당 20,000개의 단명 배열이
+ * 생긴다. 짧게 살고 죽는 객체라 개별 비용은 작지만, 이만한 빈도가 되면 minor GC
+ * 가 잦아지고 그게 프레임 중간에 걸리면 최저 FPS 로 드러난다.
+ *
+ * 그래서 프레임 루프(FleetMap)는 `toMercator` 대신 이 두 함수를 직접 쓴다.
+ * 결과를 담을 배열이 이미 있기 때문에(Point 의 flatCoordinates) 새 배열을
+ * 만들 이유가 없다.
+ *
+ * 초기화처럼 빈도가 낮은 곳에서는 읽기 좋은 `toMercator` 를 그대로 쓴다. 두 경로가
+ * 같은 값을 준다는 건 tests/geo.test.ts 가 확인한다.
+ */
+export function mercatorX(lon: number): number {
+  return EARTH_RADIUS * lon * DEG_TO_RAD
+}
+
+/** [1단계] EPSG:4326 → EPSG:3857 의 y 성분만. 위도는 투영 한계로 클램프된다. */
+export function mercatorY(lat: number): number {
+  return EARTH_RADIUS * Math.log(Math.tan(Math.PI / 4 + (clampLatitude(lat) * DEG_TO_RAD) / 2))
+}
+
 /** EPSG:4326 → EPSG:3857 */
 export function toMercator(lon: number, lat: number): [number, number] {
-  const x = EARTH_RADIUS * lon * DEG_TO_RAD
-  const clamped = clampLatitude(lat)
-  const y = EARTH_RADIUS * Math.log(Math.tan(Math.PI / 4 + (clamped * DEG_TO_RAD) / 2))
-  return [x, y]
+  return [mercatorX(lon), mercatorY(lat)]
 }
 
 /** EPSG:3857 → EPSG:4326 */

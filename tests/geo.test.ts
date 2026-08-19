@@ -5,6 +5,8 @@ import {
   clampLatitude,
   haversine,
   lonLatExtent,
+  mercatorX,
+  mercatorY,
   toLonLat,
   toMercator,
   toMercatorExtent,
@@ -102,5 +104,23 @@ describe('거리 계산', () => {
 
   it('같은 지점의 거리는 0', () => {
     expect(haversine([126.9, 37.2], [126.9, 37.2])).toBe(0)
+  })
+})
+
+describe('[1단계] 실시간 루프용 스칼라 변환', () => {
+  it('스칼라 변환이 toMercator 와 같은 값을 준다', () => {
+    // 프레임 루프는 toMercator 대신 이 둘을 쓴다. 두 경로가 갈라지면 지도와
+    // 초기 fit 이 서로 다른 좌표를 쓰게 되고, 그건 눈으로 안 잡힌다.
+    const samples: [number, number][] = [
+      [0, 0],
+      [126.9012, 37.241],
+      [-122.4194, 37.7749],
+      [180, MAX_LATITUDE],
+    ]
+    for (const [lon, lat] of samples) {
+      const [x, y] = toMercator(lon, lat)
+      expect(mercatorX(lon)).toBe(x)
+      expect(mercatorY(lat)).toBe(y)
+    }
   })
 })
