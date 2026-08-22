@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useRef } from 'react'
+import { useRouter } from 'next/navigation'
 
 import Feature from 'ol/Feature'
 import OLMap from 'ol/Map'
@@ -84,6 +85,19 @@ const Z = {
 } as const
 
 /**
+ * 지도 인스턴스 생성 횟수.
+ *
+ * 컨테이너의 data-map-instance 로 노출한다. 이 프로젝트가 내세우는 주장 중 하나가
+ * "중첩 레이아웃 덕에 /fleet ↔ /fleet/[id] 전환에도 지도 인스턴스가 유지된다" 인데,
+ * 관측할 수단이 없으면 검증도 회귀 방지도 불가능하다. 값이 그대로면 같은 인스턴스,
+ * 늘어났으면 재생성된 것이다.
+ *
+ * FleetShell 이 실수로 page.tsx 로 내려가면 이 값이 전환마다 증가하고
+ * e2e/fleet.spec.ts 가 빨개진다.
+ */
+let mapInstanceCount = 0
+
+/**
  * OpenLayers 관제 지도.
  *
  * 이 컴포넌트는 React 렌더 사이클 밖에서 동작한다. 실시간 프레임이 와도
@@ -92,6 +106,7 @@ const Z = {
  */
 export default function FleetMap() {
   const fleet = useFleet()
+  const router = useRouter()
   const containerRef = useRef<HTMLDivElement>(null)
 
   const mapRef = useRef<OLMap | null>(null)
@@ -101,6 +116,10 @@ export default function FleetMap() {
   const webglLayerRef = useRef<WebGLPointsLayer<VectorSource<Feature<Point>>> | null>(null)
   const selectionSourceRef = useRef<VectorSource<Feature<Point>> | null>(null)
   const zoneLayerRef = useRef<VectorLayer<VectorSource<Feature<Polygon>>> | null>(null)
+  // 지도 초기화 effect 는 마운트 시 1회만 돌아야 한다. router 를 직접 의존하면
+  // 재실행되며 지도가 재생성되므로 ref 로 우회한다.
+  const routerRef = useRef(router)
+  routerRef.current = router
 
   const renderMode = useFleetUi((s) => s.renderMode)
   const selectedId = useFleetUi((s) => s.selectedId)
@@ -309,6 +328,9 @@ export default function FleetMap() {
     })
     mapRef.current = map
 
+    // 인스턴스 번호를 DOM 에 남긴다. 위 mapInstanceCount 주석 참고.
+    containerRef.current.dataset.mapInstance = String(++mapInstanceCount)
+
     if (initialExtent) {
       map.getView().fit(toMercatorExtent(initialExtent), { padding: [40, 40, 40, 40] })
     }
@@ -317,6 +339,17 @@ export default function FleetMap() {
     // 주의: Canvas 레이어와 WebGL 레이어의 히트 디텍션 API 가 다르다.
     // Canvas 는 동기 forEachFeatureAtPixel, WebGL 은 비동기 getFeatures(pixel).
     // 실제로 WebGL 로 전환할 때 가장 먼저 깨지는 지점이라 분기해 둔다.
+    // 스토어와 URL 을 함께 갱신한다. 지도 강조는 즉시(스토어), 상세 패널은
+    // 라우트 전환으로(URL). 자세한 역할 분담은 useSelectRobot 주석 참고.
+    //
+    // routerRef 를 거치는 이유: 이 effect 는 마운트 시 한 번만 돌아야 하는데
+    // (지도 인스턴스를 다시 만들면 안 된다) router 를 의존성에 넣으면 그 보장이
+    // 깨진다. ref 로 최신 router 를 읽는다.
+    const selectRobot = (id: string | null) => {
+      useFleetUi.getState().select(id)
+      routerRef.current.push(id ? `/fleet/${id}` : '/fleet')
+    }
+
     const onClick = (evt: { pixel: number[] }) => {
       const mode = useFleetUi.getState().renderMode
       if (mode === 'canvas') {
@@ -324,10 +357,10 @@ export default function FleetMap() {
           layerFilter: (l) => l === canvasLayer,
           hitTolerance: 5,
         })
-        useFleetUi.getState().select(hit ? String(hit.getId()) : null)
+        selectRobot(hit ? String(hit.getId()) : null)
       } else {
         void webglLayer.getFeatures(evt.pixel).then((hits) => {
-          useFleetUi.getState().select(hits.length ? String(hits[0].getId()) : null)
+          selectRobot(hits.length ? String(hits[0].getId()) : null)
         })
       }
     }

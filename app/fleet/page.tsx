@@ -1,26 +1,18 @@
 import type { Metadata } from 'next'
 
-import { summarize } from '@/lib/delta'
 import { getSimulator } from '@/lib/simulator'
 
-import FleetShell from './_components/FleetShell'
-import SiteInfoPanel from './_components/SiteInfoPanel'
-
 /**
- * /fleet 페이지 — Server Component.
+ * /fleet 인덱스 페이지 — Server Component.
  *
- * 여기서 하는 일과 하지 않는 일이 이 프로젝트의 핵심 경계다.
+ * 아무것도 렌더하지 않는다. 화면의 거의 전부(사이드바·지도·계측)는 이제
+ * layout.tsx 의 FleetShell 이 담당하고, page.tsx 는 **상세 패널 슬롯**만 채운다.
+ * 선택된 로봇이 없는 이 라우트에서는 그 슬롯이 비어 있는 게 맞다.
  *
- *  ✅ 서버에서: 초기 스냅샷 조회, 초기 집계, 정적 사이트 메타데이터 렌더
- *     → 이 코드와 데이터는 클라이언트 번들에 실리지 않는다.
- *  ❌ 서버에서 하지 않는 것: 실시간 갱신. 지도와 표는 브라우저 API(Canvas/WebGL,
- *     EventSource)가 필요하므로 Client Component 로 내려보낸다.
- *
- * 결과적으로 "초기 스냅샷은 서버, 실시간 갱신 레이어만 클라이언트" 라는
- * 구조가 코드로 드러난다.
+ * "페이지가 비어 있다" 가 이상해 보이지만, 이 구조가 정확히 의도한 것이다.
+ * page.tsx 는 라우트가 바뀔 때 교체되는 부분이고, 유지되어야 하는 것(지도·SSE)은
+ * 전부 레이아웃에 있다. 자세한 이유는 layout.tsx 주석 참고.
  */
-
-export const dynamic = 'force-dynamic'
 
 export async function generateMetadata(): Promise<Metadata> {
   // generateMetadata 는 App Router 전용 API 다. Pages Router 의 next/head 와 달리
@@ -32,20 +24,6 @@ export async function generateMetadata(): Promise<Metadata> {
   }
 }
 
-export default async function FleetPage() {
-  const simulator = getSimulator()
-  const snapshot = simulator.snapshot()
-  const meta = simulator.meta()
-  const initialSummary = summarize(snapshot)
-
-  return (
-    <FleetShell
-      initialRobots={snapshot}
-      meta={meta}
-      // ⬇︎ Server Component 를 prop 으로 주입한다 (composition 패턴).
-      // FleetShell 은 'use client' 지만, 이 노드는 서버에서 이미 렌더된 결과라
-      // SiteInfoPanel 의 코드는 클라이언트 번들에 포함되지 않는다.
-      siteInfo={<SiteInfoPanel meta={meta} summary={initialSummary} />}
-    />
-  )
+export default function FleetIndexPage() {
+  return null
 }

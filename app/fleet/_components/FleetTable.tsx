@@ -8,6 +8,7 @@ import { STATUS_COLORS, STATUS_LABELS, type Robot, type StatusCode } from '@/lib
 import { useFleetUi } from '@/store/fleet-store'
 
 import { useFleet } from './FleetProvider'
+import { useSelectRobot } from './useSelectRobot'
 
 /**
  * 표 갱신 주기(ms).
@@ -26,7 +27,8 @@ export default function FleetTable() {
   const statusFilter = useFleetUi((s) => s.statusFilter)
   const query = useFleetUi((s) => s.query)
   const selectedId = useFleetUi((s) => s.selectedId)
-  const select = useFleetUi((s) => s.select)
+  // 스토어 갱신 + /fleet/[id] 이동을 함께 한다. 이유는 useSelectRobot 주석 참고.
+  const select = useSelectRobot()
 
   // ── 스로틀된 구독 ────────────────────────────────────────────────────────
   useEffect(() => {

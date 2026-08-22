@@ -81,3 +81,74 @@ test('구역 오버레이를 토글할 수 있다', async ({ page }) => {
   await toggle.click()
   await expect(toggle).toHaveAttribute('aria-pressed', 'false')
 })
+
+/**
+ * /fleet/[id] 상세 라우트 — 이 프로젝트가 중첩 레이아웃으로 내세우는 주장의 검증.
+ *
+ * 주장: 상세 라우트로 전환해도 지도 인스턴스와 SSE 연결이 유지된다.
+ * 검증: 지도 컨테이너의 data-map-instance 가 안 바뀌고, /api/fleet/stream 요청이
+ *       추가로 발생하지 않는다. FleetShell 이 layout.tsx 에서 page.tsx 로
+ *       내려가면 둘 다 깨진다.
+ */
+test('상세 라우트로 전환해도 지도 인스턴스와 SSE 가 유지된다', async ({ page }) => {
+  // SSE 요청 수를 센다. 재마운트되면 EventSource 가 새로 열린다.
+  let sseRequests = 0
+  page.on('request', (req) => {
+    if (req.url().includes('/api/fleet/stream')) sseRequests++
+  })
+
+  await page.goto('/fleet')
+  await expect(page.getByText('SSE 수신 중')).toBeVisible({ timeout: 15_000 })
+
+  const mapEl = page.getByRole('application', { name: '플릿 관제 지도' })
+  const before = await mapEl.getAttribute('data-map-instance')
+  expect(before).toBe('1')
+  expect(sseRequests).toBe(1)
+
+  // 목록에서 로봇을 선택 → /fleet/[id] 로 이동
+  await page.locator('button:has-text("RB-")').first().click()
+  await expect(page).toHaveURL(/\/fleet\/RB-\d+$/)
+  await expect(page.getByRole('complementary', { name: '로봇 상세' })).toBeVisible()
+
+  // 지도는 같은 인스턴스, SSE 도 같은 연결이어야 한다
+  expect(await mapEl.getAttribute('data-map-instance')).toBe(before)
+  expect(sseRequests).toBe(1)
+
+  // 닫기 → /fleet 로 복귀. 여기서도 유지되어야 한다
+  await page.getByRole('link', { name: /닫기/ }).click()
+  await expect(page).toHaveURL(/\/fleet$/)
+  expect(await mapEl.getAttribute('data-map-instance')).toBe(before)
+  expect(sseRequests).toBe(1)
+})
+
+test('상세 링크를 직접 열면 해당 로봇이 선택된 상태로 뜬다', async ({ page }) => {
+  // URL → 스토어 동기화(SelectionSync)의 검증. 이게 없으면 패널은 열려 있는데
+  // 목록·지도에는 강조가 없는 상태가 된다.
+  await page.goto('/fleet/RB-00007')
+  await expect(page.getByRole('complementary', { name: '로봇 상세' })).toBeVisible()
+  await expect(page.getByText('RB-00007', { exact: true }).first()).toBeVisible()
+
+  // 목록에서 해당 행이 강조된다
+  const row = page.locator('button:has-text("RB-00007")').first()
+  await expect(row).toHaveClass(/bg-amber/, { timeout: 10_000 })
+})
+
+test('없는 로봇 id 는 상세 패널에서만 not-found 를 보여준다', async ({ page }) => {
+  await page.goto('/fleet/RB-99999999')
+  await expect(page.getByText('등록되지 않은 로봇입니다')).toBeVisible()
+  // 지도는 죽지 않는다 — 오타 하나로 관제를 잃으면 안 된다
+  await expect(page.getByRole('application', { name: '플릿 관제 지도' })).toBeVisible()
+  await expect(page.getByText('SSE 수신 중')).toBeVisible({ timeout: 15_000 })
+})
+
+test('뒤로가기로 선택이 해제된다', async ({ page }) => {
+  await page.goto('/fleet')
+  await expect(page.getByText('SSE 수신 중')).toBeVisible({ timeout: 15_000 })
+
+  await page.locator('button:has-text("RB-")').first().click()
+  await expect(page.getByRole('complementary', { name: '로봇 상세' })).toBeVisible()
+
+  await page.goBack()
+  await expect(page).toHaveURL(/\/fleet$/)
+  await expect(page.getByRole('complementary', { name: '로봇 상세' })).toHaveCount(0)
+})

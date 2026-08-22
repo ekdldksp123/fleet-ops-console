@@ -144,6 +144,21 @@ class FleetSimulator {
     return this.robots.map((r) => ({ ...r }))
   }
 
+  /**
+   * 로봇 1대 조회. /fleet/[id] 상세 라우트가 쓴다.
+   *
+   * snapshot() 으로 전체를 뜬 뒤 find 하면 20,000개 객체를 복사하고 버리는 셈이라
+   * 상세 페이지를 열 때마다 그 비용을 낸다. byId 를 직접 쓴다.
+   *
+   * 복사해서 넘기는 이유: 원본은 tick 마다 제자리 변경되는 객체다. 그대로 넘기면
+   * 서버 렌더 중에 값이 바뀔 수 있고, 클라이언트로 직렬화되는 시점의 값이
+   * 렌더에 쓴 값과 달라질 수 있다.
+   */
+  robot(id: string): Robot | undefined {
+    const found = this.byId.get(id)
+    return found ? { ...found } : undefined
+  }
+
   subscribe(fn: Subscriber): () => void {
     this.subscribers.add(fn)
     this.start()

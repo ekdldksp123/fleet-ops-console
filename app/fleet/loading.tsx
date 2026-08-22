@@ -1,21 +1,12 @@
+import FleetSkeleton from './_components/FleetSkeleton'
+
 /**
- * App Router 의 loading.tsx — 이 세그먼트를 Suspense 경계로 자동 감싼다.
- * page.tsx 가 스냅샷을 만드는 동안 서버가 이 셸을 먼저 스트리밍하므로
- * 사용자는 흰 화면 대신 레이아웃을 즉시 본다.
+ * App Router 의 loading.tsx — 이 세그먼트의 **page** 를 Suspense 로 감싼다.
+ *
+ * ⚠️ layout.tsx 는 이 경계 **밖**이다. loading.tsx 는 page.js 와 그 하위를 감싸므로,
+ * 같은 레벨 layout.tsx 의 await 는 덮지 못한다. 스냅샷 조회가 layout 으로 올라간
+ * 뒤로는 그쪽에 별도의 Suspense 를 두어야 스켈레톤이 보인다 — layout.tsx 참고.
  */
 export default function Loading() {
-  return (
-    <div className="flex h-full animate-pulse">
-      <div className="flex w-[380px] shrink-0 flex-col gap-2 border-r border-slate-800 p-3">
-        <div className="h-8 rounded bg-slate-800/70" />
-        <div className="h-6 w-2/3 rounded bg-slate-800/50" />
-        <div className="mt-2 flex-1 space-y-1.5">
-          {Array.from({ length: 14 }).map((_, i) => (
-            <div key={i} className="h-9 rounded bg-slate-800/40" />
-          ))}
-        </div>
-      </div>
-      <div className="flex-1 bg-slate-900/60" />
-    </div>
-  )
+  return <FleetSkeleton />
 }

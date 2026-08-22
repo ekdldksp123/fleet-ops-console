@@ -64,12 +64,21 @@ yarn build           # 프로덕션 빌드
 app/
   layout.tsx                        Server — 루트 셸
   fleet/
-    layout.tsx                      Server — 중첩 레이아웃(헤더)
-    page.tsx                        Server — 초기 스냅샷 + generateMetadata
+    layout.tsx                      Server — 헤더 + 초기 스냅샷 + FleetShell ★ 지도가 여기 산다
+    page.tsx                        Server — 상세 슬롯 비움 (null) + generateMetadata
     loading.tsx                     Suspense 폴백 (스켈레톤)
     error.tsx                       Client — 에러 바운더리
+    [id]/
+      page.tsx                      Server — 로봇 상세 + generateMetadata + notFound
+      loading.tsx                   상세 패널만 덮는 스켈레톤
+      not-found.tsx                 없는 로봇 id
     _components/
       SiteInfoPanel.tsx             Server — 정적 사이트 정보
+      DetailShell.tsx               Server — 상세 패널 껍데기(3개 상태 공유)
+      FleetSkeleton.tsx             Server — 초기 로딩 스켈레톤
+      RobotLiveTelemetry.tsx        Client — 로봇 1대의 실시간 값
+      SelectionSync.tsx             Client — URL → 스토어 동기화
+      useSelectRobot.ts             Client — 선택 = 스토어 + 라우트 이동
       FleetShell.tsx                Client — 클라이언트 트리 루트
       FleetProvider.tsx             Client — SSE 수명주기
       FleetMap.tsx                  Client — OpenLayers (Canvas / WebGL)
@@ -167,6 +176,44 @@ OpenLayers `WebGLPointsLayer`의 스타일은 GPU 셰이더로 컴파일되는 �
 구역 레이어는 완전히 정적이다. 한 번 만들고 나면 실시간 루프가 건드리지 않으므로
 프레임당 비용이 0이다 — 20,000대에서 구역 ON/OFF 를 재봐도 FPS 차이가 없다
 (최장 프레임 17.9ms vs 18.1ms, 오차 범위).
+
+### 7. 중첩 레이아웃 — 지도를 살려두고 라우트를 바꾼다
+
+`/fleet` ↔ `/fleet/[id]` 를 오갈 때 **지도 인스턴스와 SSE 연결이 유지된다.**
+App Router 에서 레이아웃은 하위 라우트가 바뀌어도 언마운트되지 않는다는 성질을
+그대로 쓴 것이다.
+
+핵심은 배치다. `FleetShell`(지도 + EventSource)이 `page.tsx` 가 아니라
+**`layout.tsx`** 에 있고, 하위 라우트의 결과를 `detail` prop 으로 받는다.
+
+```
+layout.tsx   헤더 + FleetShell(지도·SSE·사이드바)   ← 유지된다
+  └ children ─ page.tsx        (/fleet)        → null
+             └ [id]/page.tsx  (/fleet/RB-42)   → 상세 패널
+```
+
+`page.tsx` 에 뒀다면 로봇을 클릭할 때마다 지도가 파괴되고 다시 만들어진다.
+팬·줌해 둔 뷰가 초기화되고, SSE 가 끊고 재연결한다.
+
+**검증 가능해야 주장이다.** 지도 컨테이너에 `data-map-instance` 로 인스턴스 번호를
+노출하고, e2e 가 라우트 전환 전후로 그 값과 `/api/fleet/stream` 요청 수가 변하지
+않음을 확인한다. `FleetShell` 이 실수로 `page.tsx` 로 내려가면 테스트가 깨진다.
+
+상세 패널 안에서 서버/클라이언트 경계가 한 번 더 반복된다.
+
+| | 담당 | 이유 |
+| --- | --- | --- |
+| id·이름·구역 | `[id]/page.tsx` (Server) | 안 변한다. 번들에도 안 실린다 |
+| 좌표·상태·배터리 | `RobotLiveTelemetry` (Client) | 10Hz 로 변한다. 서버 렌더면 죽은 화면 |
+
+선택 상태는 두 곳에 있고, 역할이 다르다. Zustand `selectedId` 는 **즉각 반응**용
+(지도 강조·목록 하이라이트), URL 은 **탐색 가능한 진실**(공유·새로고침·뒤로가기).
+클릭은 둘을 함께 갱신하고, 반대 방향은 `SelectionSync` 가 URL → 스토어 단방향으로만
+흘려 순환을 막는다. URL 하나로 몰면 클릭할 때마다 RSC 왕복이 끝나야 강조가 뜬다.
+
+**알아둘 것**: `loading.tsx` 는 같은 레벨의 `layout.tsx` 를 덮지 못한다 —
+`page.js` 와 그 하위만 Suspense 로 감싼다. 스냅샷 조회를 레이아웃으로 올렸으므로
+레이아웃 안에 `<Suspense>` 를 직접 두어야 스켈레톤이 보인다.
 
 ---
 
@@ -357,6 +404,15 @@ Point.setCoordinates → geometry.changed()          revision++ / 'change'
   변환은 프레임당 갱신된 로봇에 대해서만 한 번 수행한다.
 - **SSE 구독 해제.** `request.signal`의 abort에서 반드시 unsubscribe해야 한다.
   빠뜨리면 시뮬레이터 구독자가 계속 쌓여 메모리 누수가 난다.
+- **스트리밍 중에는 `notFound()` 가 404 를 못 만든다.** `/fleet/없는id` 는 not-found
+  패널을 정확히 렌더하지만 HTTP 상태는 **200** 이다. 레이아웃이 `force-dynamic` +
+  `<Suspense>` 로 셸을 먼저 흘려보내서, `notFound()` 가 실행될 때 이미 헤더가
+  전송된 뒤다(`Transfer-Encoding: chunked`). 상태 코드가 정확해야 한다면 레이아웃의
+  스트리밍을 포기해야 한다 — 초기 로딩 스켈레톤과의 트레이드오프다.
+- **빌드 리포트의 First Load JS 를 그대로 믿지 말 것.** 클라이언트 참조가 dynamic
+  레이아웃의 `<Suspense>` 안에 있으면 정적 분석에 안 잡혀서, `/fleet` 이 103 kB 로
+  보고된다. 실제로는 OpenLayers 청크 450 kB 가 런타임에 로드된다. HTML 의
+  `static/chunks/*` 참조로 확인할 수 있다.
 - **레이어 `zIndex` 를 음수로 두면 베이스 지도 아래로 내려간다.** 구역 폴리곤을
   로봇 아래에 깔려고 `zIndex: -1` 로 뒀더니 불투명한 OSM 타일(기본 zIndex 0)이
   완전히 덮었다. 레이어는 존재하고 토글도 먹는데 화면에는 아무것도 안 나온다.
@@ -393,7 +449,8 @@ Point.setCoordinates → geometry.changed()          revision++ / 'change'
   **볼록성**(회전 방향 일관성 + 내부 선분 포함)을 검증한다. 둘 다 깨지면 "지도에 뭔가
   그려지긴 하는데 숫자가 안 맞는" 방식으로 실패해서 눈으로 못 잡는다.
 - `e2e/fleet.spec.ts` — 서버 렌더 확인, SSE seq 증가, 선택 연동, 필터, 렌더모드 전환,
-  구역 집계·오버레이 토글 (7개)
+  구역 집계·오버레이 토글, 상세 라우트(지도 인스턴스·SSE 유지, 직접 링크, not-found,
+  뒤로가기) (11개)
 
 > `yarn test:e2e` 는 Playwright 번들 브라우저가 필요하다. 처음 실행 전에
 > `yarn playwright install chromium` 을 한 번 돌릴 것.
@@ -404,7 +461,7 @@ Point.setCoordinates → geometry.changed()          revision++ / 'change'
 
 ## 다음에 붙일 것
 
-- [ ] `/fleet/[id]` 상세 라우트 — 중첩 레이아웃 덕에 지도 인스턴스를 유지한 채 전환 가능
+- [x] `/fleet/[id]` 상세 라우트 → 아래 "중첩 레이아웃" 절
 - [ ] Parallel Routes로 알림 패널 분리
 - [ ] 로봇 경로(LineString) 히스토리 레이어
 - [x] 구역 폴리곤 오버레이 + 구역별 집계 → 아래 "구역" 절
