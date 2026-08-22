@@ -15,6 +15,8 @@ export default function RenderModeToggle() {
   const toggleFollow = useFleetUi((s) => s.toggleFollow)
   const showStats = useFleetUi((s) => s.showStats)
   const toggleStats = useFleetUi((s) => s.toggleStats)
+  const showZones = useFleetUi((s) => s.showZones)
+  const toggleZones = useFleetUi((s) => s.toggleZones)
 
   return (
     <div className="absolute right-3 top-3 z-10 flex flex-col items-end gap-1.5">
@@ -43,6 +45,9 @@ export default function RenderModeToggle() {
       <div className="flex gap-1.5">
         <MiniToggle active={followSelected} onClick={toggleFollow}>
           선택 추적
+        </MiniToggle>
+        <MiniToggle active={showZones} onClick={toggleZones}>
+          구역
         </MiniToggle>
         <MiniToggle active={showStats} onClick={toggleStats}>
           계측

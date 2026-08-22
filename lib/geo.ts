@@ -135,6 +135,39 @@ export function extentContainsXY(extent: readonly number[], x: number, y: number
   return x >= extent[0] && x <= extent[2] && y >= extent[1] && y <= extent[3]
 }
 
+/**
+ * 점이 링(다각형) 내부에 있는지 — ray casting.
+ *
+ * 링은 닫힘을 **암시**한다(마지막 점과 첫 점을 잇는다). 좌표계는 상관없다.
+ * 경위도로 판정해도, Mercator 로 판정해도 같은 답이 나온다 — 두 좌표계가 위도에
+ * 대해 단조(monotonic)이므로 점의 내/외 관계가 보존된다. 그래서 이 함수는
+ * 변환 없이 원본 경위도로 쓴다.
+ *
+ * 오목 다각형(L 자 등)도 올바르게 처리한다. `lib/zones.ts` 의 외곽 통로가 L 자다.
+ *
+ * 경계선 위의 점: `(yi > lat) !== (yj > lat)` 판정은 half-open 규칙이라, 두 다각형이
+ * 변을 공유할 때 그 변 위의 점은 **정확히 한쪽에만** 속한다. 구역이 사이트를 빈틈없이
+ * 타일링해야 하므로 이 성질이 중요하다 — tests/zones.test.ts 가 확인한다.
+ */
+export function pointInRing(ring: readonly LonLat[], lon: number, lat: number): boolean {
+  let inside = false
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const [xi, yi] = ring[i]
+    const [xj, yj] = ring[j]
+    if (yi > lat !== yj > lat && lon < ((xj - xi) * (lat - yi)) / (yj - yi) + xi) {
+      inside = !inside
+    }
+  }
+  return inside
+}
+
+/** 링의 경위도 바운딩 박스. 거부 표집(rejection sampling)의 후보 영역으로 쓴다. */
+export function ringExtent(ring: readonly LonLat[]): Extent {
+  const e = lonLatExtent(ring)
+  if (!e) throw new Error('빈 링에는 extent 가 없습니다')
+  return e
+}
+
 /** 두 경위도 지점 사이의 대권 거리 (m) */
 export function haversine(a: LonLat, b: LonLat): number {
   const dLat = (b[1] - a[1]) * DEG_TO_RAD

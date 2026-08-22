@@ -76,19 +76,21 @@ app/
       FleetTable.tsx                Client — 가상 스크롤 목록
       LiveStatusBar.tsx             Client — 실시간 집계
       FilterBar.tsx                 Client — 검색·상태 필터
+      ZoneStatsPanel.tsx            Client — 구역별 실시간 집계
       RenderModeToggle.tsx          Client — 벤치마크 스위치
       StatsOverlay.tsx              Client — FPS·프레임 계측
   api/fleet/stream/route.ts         Route Handler — SSE (ReadableStream)
 
 lib/
   types.ts        도메인 타입 (statusCode를 숫자로 두는 이유 포함)
-  geo.ts          EPSG:4326 ↔ EPSG:3857 변환 (순수 함수)
+  geo.ts          EPSG:4326 ↔ EPSG:3857 변환, 다각형 판정 (순수 함수)
+  zones.ts        구역 폴리곤 정의 (정적 사이트 데이터)
   delta.ts        델타 병합·집계·필터 (순수 함수)
   fleet-client.ts 클라이언트 실시간 보관소 ★ 핵심 설계
   simulator.ts    서버 사이드 플릿 시뮬레이터 (결정적 PRNG)
 
 store/fleet-store.ts   Zustand — UI 상태 전용
-tests/                 Vitest — geo, delta
+tests/                 Vitest — geo, delta, zones, ol-invariants
 e2e/                   Playwright
 ```
 
@@ -131,6 +133,40 @@ Zustand는 `selectedId`, `statusFilter`, `query`, `renderMode`처럼 **사람이
 
 OpenLayers `WebGLPointsLayer`의 스타일은 GPU 셰이더로 컴파일되는 표현식이고,
 숫자 속성에서 가장 안정적으로 동작한다. 사람이 읽는 라벨은 표시 직전에만 붙인다.
+
+### 6. 구역은 라벨이 아니라 공간이다
+
+`Robot.zone` 은 원래 시뮬레이터가 **위치와 무관하게 랜덤으로** 붙이는 문자열이었다.
+그 상태로 구역 폴리곤을 지도에 얹으면 오버레이가 거짓말을 한다 — "A동 적재" 라벨을
+단 로봇이 C동 폴리곤 안을 돌아다닌다.
+
+선택지가 둘이었다.
+
+| | 집계 비용 | `Robot.zone` |
+| --- | --- | --- |
+| 위치를 진실로 (매번 point-in-polygon) | 2.5Hz × N회 다각형 판정 | 죽은 데이터 |
+| **라벨을 진실로 (로봇을 구역에 가둠)** | **O(n) 문자열 카운트** | **살아 있음** |
+
+후자를 골랐다. `lib/zones.ts` 가 구역 폴리곤을 정의하고, 시뮬레이터가 초기 위치와
+웨이포인트를 **자기 구역 안에서만** 뽑는다. 그래서 집계는 문자열 카운트로 끝나고
+(`summarizeByZone`), 기존 구역 검색(`FilterBar`)도 그대로 의미를 갖는다.
+
+**구역 폴리곤이 지켜야 하는 불변식이 두 개 있고, 둘 다 테스트로 못 박았다.**
+
+1. **타일링** — 6개 폴리곤이 사이트를 빈틈도 겹침도 없이 덮는다. 틈이 있으면 그
+   틈을 배정받은 로봇이 어느 구역에도 안 잡혀 집계에서 사라진다. 인접 폴리곤이 좌표
+   상수를 공유해 부동소수점 오차로 틈이 생기지 않게 했다.
+2. **볼록성(convexity)** — 로봇은 웨이포인트로 **직선 이동**한다. 볼록 다각형에서만
+   "내부 두 점을 잇는 선분이 전부 내부" 가 보장되므로, 로봇이 자기 구역을 벗어나는
+   일이 기하학적으로 불가능해진다. 매 tick 위치를 검사할 필요가 없다.
+
+   처음에는 외곽 통로를 L 자(오목)로 뒀다가 되돌렸다. L 자에서는 남쪽 띠의 점과
+   동쪽 띠의 점을 잇는 직선이 구역 밖으로 나간다 — 로봇이 이동 중에 구역을 벗어나고,
+   막으려면 매 tick 20,000회 다각형 판정을 돌려야 했다.
+
+구역 레이어는 완전히 정적이다. 한 번 만들고 나면 실시간 루프가 건드리지 않으므로
+프레임당 비용이 0이다 — 20,000대에서 구역 ON/OFF 를 재봐도 FPS 차이가 없다
+(최장 프레임 17.9ms vs 18.1ms, 오차 범위).
 
 ---
 
@@ -321,6 +357,15 @@ Point.setCoordinates → geometry.changed()          revision++ / 'change'
   변환은 프레임당 갱신된 로봇에 대해서만 한 번 수행한다.
 - **SSE 구독 해제.** `request.signal`의 abort에서 반드시 unsubscribe해야 한다.
   빠뜨리면 시뮬레이터 구독자가 계속 쌓여 메모리 누수가 난다.
+- **레이어 `zIndex` 를 음수로 두면 베이스 지도 아래로 내려간다.** 구역 폴리곤을
+  로봇 아래에 깔려고 `zIndex: -1` 로 뒀더니 불투명한 OSM 타일(기본 zIndex 0)이
+  완전히 덮었다. 레이어는 존재하고 토글도 먹는데 화면에는 아무것도 안 나온다.
+  `FleetMap.tsx` 는 쌓임 순서를 `Z` 상수 한곳에 모아 명시한다.
+- **검증한 값을 저장할 것.** 구역 내 위치를 거부 표집으로 뽑을 때, 원본 좌표를
+  검증하고 `round6()` 한 값을 저장했다. 구역 경계값이 `126.9217` 처럼 5자리로 딱
+  떨어지는 수라서 경계 근처의 점이 반올림되며 경계를 넘어갔다 — 1,200대 중 2대가
+  라벨과 위치가 어긋났다. 폴리곤 테스트로는 절대 안 잡힌다(폴리곤은 멀쩡하다).
+  전수 검사로만 드러났다.
 - **WebGLPoints는 deprecated.** `ol` 10은 `ol/layer/WebGLVector`로 옮기라고 안내하지만
   **그대로 갈아타면 점이 움직이지 않는다.** WebGLVector의 렌더러는 좌표를
   `MixedGeometryBatch`에 담고 그 배치를 `changefeature` 이벤트로만 갱신하므로, 1단계의
@@ -344,6 +389,9 @@ Point.setCoordinates → geometry.changed()          revision++ / 'change'
   깨면 지도는 에러 없이 그냥 얼어붙는다 — 타입으로도 눈으로도 안 잡히는 실패다.
   그래서 가정 자체를 테스트로 만들었다. 여기가 빨개지면 `FleetMap.tsx`의 갱신 경로를
   다시 검토해야 한다는 신호다.
+- `tests/zones.test.ts` — 구역 폴리곤의 **타일링**(격자 3,600점으로 빈틈·겹침 탐색)과
+  **볼록성**(회전 방향 일관성 + 내부 선분 포함)을 검증한다. 둘 다 깨지면 "지도에 뭔가
+  그려지긴 하는데 숫자가 안 맞는" 방식으로 실패해서 눈으로 못 잡는다.
 - `e2e/fleet.spec.ts` — 서버 렌더 확인, SSE seq 증가, 선택 연동, 필터, 렌더모드 전환
 
 캔버스 픽셀은 검증하지 않는다. 의미가 없고 깨지기만 한다.
@@ -355,5 +403,5 @@ Point.setCoordinates → geometry.changed()          revision++ / 'change'
 - [ ] `/fleet/[id]` 상세 라우트 — 중첩 레이아웃 덕에 지도 인스턴스를 유지한 채 전환 가능
 - [ ] Parallel Routes로 알림 패널 분리
 - [ ] 로봇 경로(LineString) 히스토리 레이어
-- [ ] 구역 폴리곤 오버레이 + 구역별 집계
+- [x] 구역 폴리곤 오버레이 + 구역별 집계 → 아래 "구역" 절
 - [ ] Server Actions로 로봇 정지/호출 명령 (여기서 WebSocket 전환 검토)

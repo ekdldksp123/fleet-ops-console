@@ -6,12 +6,13 @@ import Feature from 'ol/Feature'
 import OLMap from 'ol/Map'
 import View from 'ol/View'
 import Point from 'ol/geom/Point'
+import Polygon from 'ol/geom/Polygon'
 import TileLayer from 'ol/layer/Tile'
 import VectorLayer from 'ol/layer/Vector'
 import WebGLPointsLayer from 'ol/layer/WebGLPoints'
 import OSM from 'ol/source/OSM'
 import VectorSource from 'ol/source/Vector'
-import { Circle as CircleStyle, Fill, Stroke, Style } from 'ol/style'
+import { Circle as CircleStyle, Fill, Stroke, Style, Text } from 'ol/style'
 
 import {
   extentContainsXY,
@@ -23,6 +24,7 @@ import {
   toMercatorExtent,
 } from '@/lib/geo'
 import { STATUS_COLORS, type StatusCode } from '@/lib/types'
+import { ZONES } from '@/lib/zones'
 import { useFleetUi } from '@/store/fleet-store'
 
 import { useFleet } from './FleetProvider'
@@ -69,6 +71,19 @@ import { useFleet } from './FleetProvider'
 const CULL_MARGIN_PX = 128
 
 /**
+ * 레이어 쌓임 순서.
+ *
+ * 배열 순서로도 결정되지만(같은 zIndex 안에서는 배열 순서), 한곳에 모아 명시한다.
+ * 레이어를 추가할 때 "타일 아래로 내려가서 안 보이는" 사고가 실제로 났다.
+ */
+const Z = {
+  TILE: 0,
+  ZONE: 1,
+  ROBOTS: 2,
+  SELECTION: 10,
+} as const
+
+/**
  * OpenLayers 관제 지도.
  *
  * 이 컴포넌트는 React 렌더 사이클 밖에서 동작한다. 실시간 프레임이 와도
@@ -85,10 +100,12 @@ export default function FleetMap() {
   const canvasLayerRef = useRef<VectorLayer<VectorSource<Feature<Point>>> | null>(null)
   const webglLayerRef = useRef<WebGLPointsLayer<VectorSource<Feature<Point>>> | null>(null)
   const selectionSourceRef = useRef<VectorSource<Feature<Point>> | null>(null)
+  const zoneLayerRef = useRef<VectorLayer<VectorSource<Feature<Polygon>>> | null>(null)
 
   const renderMode = useFleetUi((s) => s.renderMode)
   const selectedId = useFleetUi((s) => s.selectedId)
   const followSelected = useFleetUi((s) => s.followSelected)
+  const showZones = useFleetUi((s) => s.showZones)
 
   // ── 1. 지도 초기화 (한 번만) ──────────────────────────────────────────────
   useEffect(() => {
@@ -158,6 +175,7 @@ export default function FleetMap() {
       source,
       style: (feature) => styleFor(feature.get('statusCode') as number),
       visible: true,
+      zIndex: Z.ROBOTS,
     })
     canvasLayerRef.current = canvasLayer
 
@@ -176,6 +194,7 @@ export default function FleetMap() {
     const webglLayer = new WebGLPointsLayer({
       source,
       visible: false,
+      zIndex: Z.ROBOTS,
       style: {
         'circle-radius': 4,
         'circle-fill-color': [
@@ -196,6 +215,68 @@ export default function FleetMap() {
     })
     webglLayerRef.current = webglLayer
 
+    // ── 구역 폴리곤 레이어 ──
+    //
+    // 완전히 정적이다. 한 번 만들고 나면 실시간 루프가 절대 건드리지 않는다.
+    // 그래서 프레임당 비용이 0이다 — OL 은 소스 revision 이 안 변하면 replay group
+    // 을 재사용한다. 폴리곤 6개가 FPS 에 영향을 주지 않는 이유가 이것이다.
+    //
+    // 좌표계 주의: zones.ts 의 링은 경위도이고 지도는 Mercator 다. 여기서 한 번만
+    // 변환한다. 그리고 OL 의 Polygon 은 **닫힌 링**을 요구하므로(첫 점 == 끝 점)
+    // 첫 점을 뒤에 한 번 더 붙인다. zones.ts 는 닫힘을 암시로 두는 규약이라
+    // 이 변환이 두 규약을 잇는 지점이다.
+    const zoneSource = new VectorSource<Feature<Polygon>>({
+      features: ZONES.map((zone) => {
+        const mercatorRing = zone.ring.map(([lon, lat]) => toMercator(lon, lat))
+        mercatorRing.push(mercatorRing[0])
+        const feature = new Feature({ geometry: new Polygon([mercatorRing]) })
+        feature.set('name', zone.name, true)
+        feature.set('short', zone.short, true)
+        return feature
+      }),
+      wrapX: false,
+    })
+
+    const zoneLayer = new VectorLayer({
+      source: zoneSource,
+      // 스타일 객체를 한 번만 만들어 모든 폴리곤이 공유한다. 라벨만 피처별로 다르니
+      // 스타일 함수에서 텍스트만 갈아 끼운다 — Style 을 매번 new 하지 않는다.
+      style: (() => {
+        const style = new Style({
+          // 채움은 아주 옅게. 6개 구역이 화면을 다 덮으므로 조금만 진해도 지도가
+          // 탁해지고 로봇 색(상태)이 안 읽힌다.
+          fill: new Fill({ color: 'rgba(56, 189, 248, 0.05)' }),
+          // 파선으로 그린다. 실선이면 OSM 배경의 도로·행정경계선과 구별이 안 돼서
+          // "이게 구역선인지 지도인지" 알 수 없다. 파선은 오버레이라는 신호다.
+          stroke: new Stroke({
+            color: 'rgba(56, 189, 248, 0.85)',
+            width: 1.5,
+            lineDash: [6, 4],
+          }),
+          text: new Text({
+            font: '600 11px ui-sans-serif, system-ui, sans-serif',
+            fill: new Fill({ color: 'rgba(224, 242, 254, 0.95)' }),
+            // 배경이 밝은 지도 타일이라 어두운 외곽선이 없으면 글자가 안 읽힌다.
+            stroke: new Stroke({ color: 'rgba(2, 6, 23, 0.85)', width: 3.5 }),
+            overflow: true,
+          }),
+        })
+        return (feature: { get: (k: string) => unknown }) => {
+          style.getText()?.setText(String(feature.get('name')))
+          return style
+        }
+      })(),
+      // ⚠️ zIndex 를 -1 로 두면 안 된다. 베이스 타일 레이어(기본 zIndex 0)보다
+      // 아래로 내려가서 불투명한 OSM 타일이 폴리곤을 완전히 덮는다. 레이어는
+      // 존재하고 토글도 먹지만 화면에는 아무것도 안 나온다 — 처음에 이걸로 한 번
+      // 헤맸다. 타일 위, 로봇 아래가 맞다.
+      zIndex: Z.ZONE,
+      // 구역 라벨이 화면 밖으로 나가도 그리도록 여유를 준다. 폴리곤이 크기 때문에
+      // 기본 renderBuffer(100px)로는 줌인 시 라벨이 사라진다.
+      renderBuffer: 600,
+    })
+    zoneLayerRef.current = zoneLayer
+
     // 선택 강조는 별도의 작은 레이어로 뺀다. 본 레이어를 restyle 하면
     // 2,000개 피처 전체가 다시 그려진다.
     const selectionSource = new VectorSource<Feature<Point>>({ wrapX: false })
@@ -209,14 +290,20 @@ export default function FleetMap() {
           fill: new Fill({ color: 'rgba(251, 191, 36, 0.15)' }),
         }),
       }),
-      zIndex: 10,
+      zIndex: Z.SELECTION,
     })
 
     const initialExtent = lonLatExtent(robots.map((r) => [r.lon, r.lat] as const))
 
     const map = new OLMap({
       target: containerRef.current,
-      layers: [new TileLayer({ source: new OSM() }), canvasLayer, webglLayer, selectionLayer],
+      layers: [
+        new TileLayer({ source: new OSM(), zIndex: Z.TILE }),
+        zoneLayer,
+        canvasLayer,
+        webglLayer,
+        selectionLayer,
+      ],
       view: new View({ center: toMercator(126.9012, 37.241), zoom: 14 }),
       controls: [],
     })
@@ -565,7 +652,16 @@ export default function FleetMap() {
     webglLayerRef.current?.setVisible(renderMode === 'webgl')
   }, [renderMode])
 
-  // ── 4. 선택 강조 + 추적 ──────────────────────────────────────────────────
+  // ── 4. 구역 오버레이 표시 여부 ────────────────────────────────────────────
+  //
+  // setVisible 만으로 끝난다. 숨긴 레이어는 OL 이 prepareFrame 자체를 건너뛰므로
+  // 껐을 때 비용이 정확히 0이다 — 벤치마크에서 구역 렌더 비용을 빼고 재려면 이게
+  // 보장되어야 한다.
+  useEffect(() => {
+    zoneLayerRef.current?.setVisible(showZones)
+  }, [showZones])
+
+  // ── 5. 선택 강조 + 추적 ──────────────────────────────────────────────────
   useEffect(() => {
     const selectionSource = selectionSourceRef.current
     if (!selectionSource) return

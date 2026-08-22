@@ -1,6 +1,8 @@
 import 'server-only'
 
+import { pointInRing } from './geo'
 import type { DeltaFrame, FleetMeta, Robot, RobotDelta, StatusCode } from './types'
+import { ZONES, ZONE_EXTENTS } from './zones'
 
 /**
  * 서버 사이드 플릿 시뮬레이터.
@@ -17,9 +19,9 @@ import type { DeltaFrame, FleetMeta, Robot, RobotDelta, StatusCode } from './typ
  *  - 구독자가 0명이면 tick 을 멈춘다. 탭을 닫아둔 채 CPU 를 태우지 않는다.
  */
 
-const SITE_CENTER: [number, number] = [126.9012, 37.241]
-const SITE_SPAN = 0.055 // 대략 4~5km 사방
-const ZONES = ['A동 적재', 'B동 조립', 'C동 도장', 'D동 출하', '충전 스테이션', '외곽 통로']
+// 사이트 경계와 구역 폴리곤의 정본은 lib/zones.ts 다. 좌표를 여기에 또 적으면
+// 두 곳이 어긋나서 폴리곤 밖에 로봇이 생기는 사고가 난다. 그래서 이 파일에는
+// 사이트 좌표 상수가 하나도 남아 있지 않다 — 위치는 전부 pointInZone() 을 거친다.
 
 function mulberry32(seed: number): () => number {
   let a = seed >>> 0
@@ -45,6 +47,8 @@ class FleetSimulator {
   private robots: Robot[] = []
   private byId = new Map<string, Robot>()
   private waypoints: Waypoint[] = []
+  /** 로봇이 어느 구역 소속인지. 새 웨이포인트를 같은 구역에서 뽑기 위해 들고 있다. */
+  private zoneIndexById = new Map<string, number>()
   private subscribers = new Set<Subscriber>()
   private timer: ReturnType<typeof setInterval> | null = null
   private seq = 0
@@ -59,42 +63,78 @@ class FleetSimulator {
   }
 
   private seed() {
-    const [cLon, cLat] = SITE_CENTER
     for (let i = 0; i < this.size; i++) {
-      const lon = cLon + (this.rand() - 0.5) * SITE_SPAN
-      const lat = cLat + (this.rand() - 0.5) * SITE_SPAN * 0.7
+      // 구역을 라운드로빈으로 배정한다. 랜덤으로 뽑으면 구역별 대수가 들쭉날쭉해서
+      // 구역 집계 패널을 읽을 때 "이게 원래 그런 건지 버그인지" 판단이 어렵다.
+      // 구역 면적은 서로 다르므로 대수가 같아도 밀도는 다르게 보인다.
+      const zoneIndex = i % ZONES.length
+      const zone = ZONES[zoneIndex]
+
+      // 위치를 구역 **안에서** 뽑는다. 이게 이 시뮬레이터의 달라진 점이다.
+      // 예전에는 사이트 전체에서 뽑고 zone 라벨을 따로 랜덤 배정했다 — 라벨과
+      // 위치가 무관해서 구역 오버레이가 거짓말을 했다.
+      // pointInZone 이 이미 round6 된 값을 준다. 여기서 또 반올림하면 안 된다.
+      const { lon, lat } = this.pointInZone(zoneIndex)
+
       const roll = this.rand()
       // 이동중이 다수, 오류는 소수인 현실적인 분포
       const statusCode: StatusCode = roll < 0.62 ? 1 : roll < 0.8 ? 0 : roll < 0.96 ? 2 : 3
       const robot: Robot = {
         id: `RB-${String(i).padStart(5, '0')}`,
         name: `AMR ${String(i + 1).padStart(4, '0')}`,
-        zone: ZONES[Math.floor(this.rand() * ZONES.length)],
-        lon: round6(lon),
-        lat: round6(lat),
+        zone: zone.name,
+        lon,
+        lat,
         statusCode,
         battery: Math.round(20 + this.rand() * 80),
       }
       this.robots.push(robot)
       this.byId.set(robot.id, robot)
+      this.zoneIndexById.set(robot.id, zoneIndex)
       this.initialDistribution[statusCode]++
-      this.waypoints.push(this.newWaypoint())
+      this.waypoints.push(this.pointInZone(zoneIndex))
     }
   }
 
-  private newWaypoint(): Waypoint {
-    const [cLon, cLat] = SITE_CENTER
-    return {
-      lon: cLon + (this.rand() - 0.5) * SITE_SPAN,
-      lat: cLat + (this.rand() - 0.5) * SITE_SPAN * 0.7,
+  /**
+   * 구역 폴리곤 내부의 임의의 점 — 거부 표집(rejection sampling).
+   *
+   * 바운딩 박스에서 점을 뽑고 폴리곤 안인지 확인해서, 아니면 다시 뽑는다.
+   * 최악은 외곽 통로(L 자)로 bbox 대비 면적이 약 4분의 1이라 평균 4회쯤 돈다.
+   *
+   * MAX_TRIES 로 상한을 둔다. 폴리곤 좌표를 잘못 적어 면적이 0이 되면 이 루프가
+   * 영원히 돌아 서버가 뜨지 않는다 — 무한 루프보다는 중심점 폴백이 낫고, 그런
+   * 상황은 tests/zones.test.ts 가 먼저 잡아준다.
+   */
+  private pointInZone(zoneIndex: number): Waypoint {
+    const zone = ZONES[zoneIndex]
+    const e = ZONE_EXTENTS[zoneIndex]
+    const MAX_TRIES = 40
+
+    for (let t = 0; t < MAX_TRIES; t++) {
+      // ⚠️ 반올림을 **먼저** 하고 그 값을 검증한다. 순서가 뒤집히면 조용히 깨진다.
+      //
+      // 예전에는 원본 좌표를 검증하고 round6 한 값을 저장했다. 구역 경계값이
+      // 126.9217 처럼 5자리로 딱 떨어지는 수라서, 경계에서 1e-6 이내로 뽑힌 점이
+      // 반올림되며 경계를 넘어갔다. 1,200대 중 2대가 라벨과 위치가 어긋났고,
+      // 타일링 테스트로는 절대 안 잡혔다 — 폴리곤은 멀쩡하고 반올림이 범인이라서다.
+      //
+      // 규칙: 검증한 값을 저장한다. 저장할 값을 검증한다.
+      const lon = round6(e.minLon + this.rand() * (e.maxLon - e.minLon))
+      const lat = round6(e.minLat + this.rand() * (e.maxLat - e.minLat))
+      if (pointInRing(zone.ring, lon, lat)) return { lon, lat }
     }
+
+    // 폴백: bbox 중심. 오목 다각형이면 폴리곤 밖일 수 있지만, 여기 온 것 자체가
+    // 이미 데이터 오류라서 정확도보다 "서버가 뜨는 것" 이 우선이다.
+    return { lon: (e.minLon + e.maxLon) / 2, lat: (e.minLat + e.maxLat) / 2 }
   }
 
   meta(): FleetMeta {
     return {
       size: this.size,
       tickMs: this.tickMs,
-      zones: [...ZONES],
+      zones: ZONES.map((z) => z.name),
       initialDistribution: { ...this.initialDistribution },
     }
   }
@@ -140,7 +180,9 @@ class FleetSimulator {
         const dist = Math.hypot(dLon, dLat)
 
         if (dist < 0.00015) {
-          this.waypoints[i] = this.newWaypoint()
+          // 다음 목표도 **같은 구역 안에서** 뽑는다. 이 한 줄이 로봇을 자기 구역에
+          // 머물게 하고, 그래서 구역 오버레이와 구역 집계가 서로 맞는다.
+          this.waypoints[i] = this.pointInZone(this.zoneIndexById.get(r.id) ?? 0)
           if (this.rand() < 0.25) r.statusCode = 0 // 잠깐 대기
         } else {
           const step = 0.00022 + this.rand() * 0.00012

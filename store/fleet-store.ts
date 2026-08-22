@@ -21,6 +21,7 @@ interface FleetUiState {
   renderMode: RenderMode
   followSelected: boolean
   showStats: boolean
+  showZones: boolean
 
   select: (id: string | null) => void
   setStatusFilter: (v: StatusCode | 'all') => void
@@ -28,6 +29,7 @@ interface FleetUiState {
   setRenderMode: (v: RenderMode) => void
   toggleFollow: () => void
   toggleStats: () => void
+  toggleZones: () => void
 }
 
 export const useFleetUi = create<FleetUiState>((set) => ({
@@ -39,6 +41,7 @@ export const useFleetUi = create<FleetUiState>((set) => ({
   renderMode: 'canvas',
   followSelected: true,
   showStats: true,
+  showZones: true,
 
   select: (id) => set({ selectedId: id }),
   setStatusFilter: (statusFilter) => set({ statusFilter }),
@@ -46,4 +49,7 @@ export const useFleetUi = create<FleetUiState>((set) => ({
   setRenderMode: (renderMode) => set({ renderMode }),
   toggleFollow: () => set((s) => ({ followSelected: !s.followSelected })),
   toggleStats: () => set((s) => ({ showStats: !s.showStats })),
+  // 구역 오버레이는 껐다 켤 수 있어야 한다. 벤치마크할 때 폴리곤 6개의 렌더 비용을
+  // 빼고 재려면 필요하고, 로봇이 빽빽한 구역에서는 시야를 가린다.
+  toggleZones: () => set((s) => ({ showZones: !s.showZones })),
 }))

@@ -11,6 +11,7 @@ import FilterBar from './FilterBar'
 import LiveStatusBar from './LiveStatusBar'
 import RenderModeToggle from './RenderModeToggle'
 import StatsOverlay from './StatsOverlay'
+import ZoneStatsPanel from './ZoneStatsPanel'
 
 /**
  * 클라이언트 트리의 루트.
@@ -38,6 +39,7 @@ export default function FleetShell({
         <aside className="flex w-[380px] shrink-0 flex-col border-r border-slate-800 bg-slate-950/40">
           {siteInfo}
           <LiveStatusBar />
+          <ZoneStatsPanel />
           <FilterBar />
           <FleetTable />
         </aside>

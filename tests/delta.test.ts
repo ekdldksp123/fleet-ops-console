@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 
-import { applyDelta, filterRobots, summarize } from '@/lib/delta'
+import { applyDelta, filterRobots, summarize, summarizeByZone } from '@/lib/delta'
 import type { DeltaFrame, Robot } from '@/lib/types'
 
 function robot(overrides: Partial<Robot> = {}): Robot {
@@ -133,5 +133,72 @@ describe('filterRobots', () => {
   it('상태와 검색어를 함께 적용한다 (AND)', () => {
     const result = filterRobots(fleet, { statusFilter: 0, query: 'A동' })
     expect(result.map((r) => r.id)).toEqual(['RB-00003'])
+  })
+})
+
+describe('구역별 집계', () => {
+  const zones = ['A동 적재', 'B동 조립', 'C동 도장']
+
+  it('구역별로 상태·저전력을 센다', () => {
+    const robots = [
+      robot({ id: 'a1', zone: 'A동 적재', statusCode: 1, battery: 80 }),
+      robot({ id: 'a2', zone: 'A동 적재', statusCode: 3, battery: 10 }),
+      robot({ id: 'b1', zone: 'B동 조립', statusCode: 1, battery: 50 }),
+    ]
+    const [a, b, c] = summarizeByZone(robots, zones)
+
+    expect(a).toEqual({
+      zone: 'A동 적재',
+      total: 2,
+      byStatus: { 0: 0, 1: 1, 2: 0, 3: 1 },
+      lowBattery: 1,
+    })
+    expect(b.total).toBe(1)
+    expect(c.total).toBe(0)
+  })
+
+  it('0대인 구역도 행을 유지한다', () => {
+    // 행이 사라지면 실시간 갱신에서 표 높이가 흔들리고 눈으로 추적이 안 된다.
+    const result = summarizeByZone([], zones)
+    expect(result).toHaveLength(3)
+    expect(result.map((r) => r.zone)).toEqual(zones)
+    expect(result.every((r) => r.total === 0)).toBe(true)
+  })
+
+  it('출력 순서가 입력 zones 순서로 고정된다', () => {
+    // 대수 순 정렬이면 값이 흔들릴 때마다 행이 위아래로 튄다.
+    const robots = [
+      robot({ id: 'c1', zone: 'C동 도장' }),
+      robot({ id: 'c2', zone: 'C동 도장' }),
+      robot({ id: 'c3', zone: 'C동 도장' }),
+      robot({ id: 'a1', zone: 'A동 적재' }),
+    ]
+    expect(summarizeByZone(robots, zones).map((r) => r.zone)).toEqual(zones)
+  })
+
+  it('목록에 없는 구역은 버리지 않고 뒤에 붙인다', () => {
+    // 조용히 버리면 합계가 안 맞는데 단서가 없다.
+    const robots = [robot({ id: 'x1', zone: '알 수 없는 구역' })]
+    const result = summarizeByZone(robots, zones)
+
+    expect(result).toHaveLength(4)
+    expect(result[3]).toMatchObject({ zone: '알 수 없는 구역', total: 1 })
+    // 합계가 보존된다
+    expect(result.reduce((n, r) => n + r.total, 0)).toBe(robots.length)
+  })
+
+  it('전체 합계가 summarize 와 일치한다', () => {
+    const robots = [
+      robot({ id: 'a1', zone: 'A동 적재', statusCode: 0 }),
+      robot({ id: 'b1', zone: 'B동 조립', statusCode: 2 }),
+      robot({ id: 'z1', zone: '외곽 통로', statusCode: 3 }),
+    ]
+    const whole = summarize(robots)
+    const byZone = summarizeByZone(robots, zones)
+
+    expect(byZone.reduce((n, r) => n + r.total, 0)).toBe(whole.total)
+    for (const code of [0, 1, 2, 3] as const) {
+      expect(byZone.reduce((n, r) => n + r.byStatus[code], 0)).toBe(whole.byStatus[code])
+    }
   })
 })
