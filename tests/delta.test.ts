@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 
-import { applyDelta, filterRobots, summarize, summarizeByZone } from '@/lib/delta'
+import { applyDelta, collectAlerts, filterRobots, summarize, summarizeByZone } from '@/lib/delta'
 import type { DeltaFrame, Robot } from '@/lib/types'
 
 function robot(overrides: Partial<Robot> = {}): Robot {
@@ -200,5 +200,68 @@ describe('구역별 집계', () => {
     for (const code of [0, 1, 2, 3] as const) {
       expect(byZone.reduce((n, r) => n + r.byStatus[code], 0)).toBe(whole.byStatus[code])
     }
+  })
+})
+
+describe('경보 수집', () => {
+  it('오류와 저전력을 각각 센다', () => {
+    const { alerts, totalErrors, totalLowBattery } = collectAlerts([
+      robot({ id: 'a', statusCode: 3, battery: 90 }),
+      robot({ id: 'b', statusCode: 1, battery: 5 }),
+      robot({ id: 'c', statusCode: 1, battery: 80 }),
+    ])
+    expect(totalErrors).toBe(1)
+    expect(totalLowBattery).toBe(1)
+    expect(alerts).toHaveLength(2)
+  })
+
+  it('오류 로봇은 배터리가 낮아도 오류 한 줄만 차지한다', () => {
+    // 두 줄이 되면 경보 개수와 로봇 대수가 안 맞아 헷갈린다.
+    const { alerts, totalErrors, totalLowBattery } = collectAlerts([
+      robot({ id: 'a', statusCode: 3, battery: 3 }),
+    ])
+    expect(alerts).toHaveLength(1)
+    expect(alerts[0].kind).toBe('error')
+    expect(totalErrors).toBe(1)
+    expect(totalLowBattery).toBe(0)
+  })
+
+  it('오류가 저전력보다 먼저, 같은 종류면 배터리 낮은 순', () => {
+    const { alerts } = collectAlerts([
+      robot({ id: 'low1', statusCode: 1, battery: 15 }),
+      robot({ id: 'err1', statusCode: 3, battery: 90 }),
+      robot({ id: 'low2', statusCode: 1, battery: 4 }),
+      robot({ id: 'err2', statusCode: 3, battery: 10 }),
+    ])
+    expect(alerts.map((a) => a.robotId)).toEqual(['err2', 'err1', 'low2', 'low1'])
+  })
+
+  it('배터리까지 같으면 id 순으로 안정 정렬한다', () => {
+    // 실시간 갱신에서 순서가 흔들리면 목록을 눈으로 못 읽는다.
+    const { alerts } = collectAlerts([
+      robot({ id: 'RB-9', statusCode: 3, battery: 50 }),
+      robot({ id: 'RB-1', statusCode: 3, battery: 50 }),
+      robot({ id: 'RB-5', statusCode: 3, battery: 50 }),
+    ])
+    expect(alerts.map((a) => a.robotId)).toEqual(['RB-1', 'RB-5', 'RB-9'])
+  })
+
+  it('limit 으로 목록을 자르지만 total 은 전체를 센다', () => {
+    // 잘린 개수를 호출자가 알 수 있어야 조용히 감추는 게 아니다.
+    const many = Array.from({ length: 100 }, (_, i) =>
+      robot({ id: `RB-${i}`, statusCode: 3, battery: 50 }),
+    )
+    const { alerts, totalErrors } = collectAlerts(many, 10)
+    expect(alerts).toHaveLength(10)
+    expect(totalErrors).toBe(100)
+  })
+
+  it('경보가 없으면 빈 목록', () => {
+    const { alerts, totalErrors, totalLowBattery } = collectAlerts([
+      robot({ id: 'a', statusCode: 1, battery: 80 }),
+    ])
+    expect(alerts).toEqual([])
+    expect(totalErrors).toBe(0)
+    expect(totalLowBattery).toBe(0)
   })
 })

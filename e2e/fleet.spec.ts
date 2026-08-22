@@ -1,9 +1,28 @@
-import { expect, test } from '@playwright/test'
+import { expect, test, type Page } from '@playwright/test'
 
 /**
  * E2E 는 "실시간 파이프라인이 실제로 살아 있는가" 만 검증한다.
  * 픽셀 단위 검증은 캔버스라 의미가 없고, 유닛 테스트가 로직을 이미 덮는다.
  */
+
+/**
+ * 표의 로봇 행. 경보 레일에도 RB- 로 시작하는 버튼이 있어서 범위를 좁혀야 한다.
+ * 범위를 안 좁히면 "RB- 를 포함한 버튼" 이 두 목록에 걸쳐 모호해진다.
+ */
+const tableRows = (page: Page) =>
+  page.getByRole('region', { name: '로봇 목록' }).locator('button:has-text("RB-")')
+
+/**
+ * 클라이언트가 살아나기를 기다린다.
+ *
+ * SSE 연결 표시는 "하이드레이션이 끝나 이벤트 핸들러가 붙었다" 는 뜻이기도 하다.
+ * 이걸 안 기다리고 클릭하면 핸들러가 붙기 전에 이벤트가 들어가 아무 일도 안 난다.
+ * 클라이언트 트리가 커질 때마다 조용히 깨지는 종류의 레이스다 — @alerts 슬롯을
+ * 추가했을 때 실제로 이 테스트가 깨졌다.
+ */
+async function waitForLive(page: Page) {
+  await expect(page.getByText('SSE 수신 중')).toBeVisible({ timeout: 20_000 })
+}
 
 test('초기 스냅샷이 서버에서 렌더된다', async ({ page }) => {
   await page.goto('/fleet')
@@ -18,7 +37,7 @@ test('초기 스냅샷이 서버에서 렌더된다', async ({ page }) => {
 
 test('SSE 스트림이 연결되고 상태가 갱신된다', async ({ page }) => {
   await page.goto('/fleet')
-  await expect(page.getByText('SSE 수신 중')).toBeVisible({ timeout: 15_000 })
+  await waitForLive(page)
 
   // 계측 오버레이의 프레임 seq 가 증가하는지 확인
   const overlay = page.locator('text=프레임 seq').locator('..')
@@ -30,9 +49,15 @@ test('SSE 스트림이 연결되고 상태가 갱신된다', async ({ page }) =>
 
 test('목록에서 로봇을 선택하면 강조된다', async ({ page }) => {
   await page.goto('/fleet')
-  const firstRow = page.locator('button:has-text("RB-")').first()
+  await waitForLive(page)
+
+  const firstRow = tableRows(page).first()
+  const id = (await firstRow.textContent())?.match(/RB-\d+/)?.[0]
   await firstRow.click()
-  await expect(firstRow).toHaveClass(/bg-amber/)
+
+  // 로케이터를 다시 해석해도 같은 행을 가리키도록 id 로 고정한다. 선택 시
+  // 가상 스크롤이 움직이면 "첫 번째 행" 이 다른 행이 될 수 있다.
+  await expect(tableRows(page).filter({ hasText: id! }).first()).toHaveClass(/bg-amber/)
 })
 
 test('검색 필터가 목록을 줄인다', async ({ page }) => {
@@ -98,7 +123,7 @@ test('상세 라우트로 전환해도 지도 인스턴스와 SSE 가 유지된�
   })
 
   await page.goto('/fleet')
-  await expect(page.getByText('SSE 수신 중')).toBeVisible({ timeout: 15_000 })
+  await waitForLive(page)
 
   const mapEl = page.getByRole('application', { name: '플릿 관제 지도' })
   const before = await mapEl.getAttribute('data-map-instance')
@@ -106,7 +131,7 @@ test('상세 라우트로 전환해도 지도 인스턴스와 SSE 가 유지된�
   expect(sseRequests).toBe(1)
 
   // 목록에서 로봇을 선택 → /fleet/[id] 로 이동
-  await page.locator('button:has-text("RB-")').first().click()
+  await tableRows(page).first().click()
   await expect(page).toHaveURL(/\/fleet\/RB-\d+$/)
   await expect(page.getByRole('complementary', { name: '로봇 상세' })).toBeVisible()
 
@@ -129,7 +154,7 @@ test('상세 링크를 직접 열면 해당 로봇이 선택된 상태로 뜬다
   await expect(page.getByText('RB-00007', { exact: true }).first()).toBeVisible()
 
   // 목록에서 해당 행이 강조된다
-  const row = page.locator('button:has-text("RB-00007")').first()
+  const row = tableRows(page).filter({ hasText: 'RB-00007' }).first()
   await expect(row).toHaveClass(/bg-amber/, { timeout: 10_000 })
 })
 
@@ -138,17 +163,55 @@ test('없는 로봇 id 는 상세 패널에서만 not-found 를 보여준다', a
   await expect(page.getByText('등록되지 않은 로봇입니다')).toBeVisible()
   // 지도는 죽지 않는다 — 오타 하나로 관제를 잃으면 안 된다
   await expect(page.getByRole('application', { name: '플릿 관제 지도' })).toBeVisible()
-  await expect(page.getByText('SSE 수신 중')).toBeVisible({ timeout: 15_000 })
+  await waitForLive(page)
 })
 
 test('뒤로가기로 선택이 해제된다', async ({ page }) => {
   await page.goto('/fleet')
-  await expect(page.getByText('SSE 수신 중')).toBeVisible({ timeout: 15_000 })
+  await waitForLive(page)
 
-  await page.locator('button:has-text("RB-")').first().click()
+  await tableRows(page).first().click()
   await expect(page.getByRole('complementary', { name: '로봇 상세' })).toBeVisible()
 
   await page.goBack()
   await expect(page).toHaveURL(/\/fleet$/)
   await expect(page.getByRole('complementary', { name: '로봇 상세' })).toHaveCount(0)
+})
+
+/**
+ * @alerts Parallel Route 슬롯.
+ *
+ * 특히 **하드 내비게이션**(직접 링크·새로고침)을 반드시 덮는다. 소프트 전환은
+ * Next 가 슬롯 상태를 기억해 유지하지만, 하드 내비게이션에서는 default.tsx 가
+ * 없으면 슬롯이 조용히 사라진다 — 에러도 안 난다. 개발 중 실제로 이걸로 헤맸다.
+ */
+test('경보 레일이 모든 라우트에서 렌더된다 (하드 내비게이션 포함)', async ({ page }) => {
+  for (const url of ['/fleet', '/fleet/RB-00042', '/fleet/RB-99999999']) {
+    await page.goto(url)
+    await expect(
+      page.getByRole('complementary', { name: '경보' }),
+      `${url} 에서 경보 레일이 없다 — @alerts/default.tsx 를 확인할 것`,
+    ).toBeVisible({ timeout: 15_000 })
+  }
+})
+
+test('경보를 클릭하면 그 로봇의 상세 라우트로 이동한다', async ({ page }) => {
+  await page.goto('/fleet')
+  await waitForLive(page)
+
+  const rail = page.getByRole('complementary', { name: '경보' })
+  const first = rail.getByRole('button').first()
+  await expect(first).toBeVisible({ timeout: 15_000 })
+
+  const id = (await first.textContent())?.match(/RB-\d+/)?.[0]
+  expect(id).toBeTruthy()
+
+  await first.click()
+  // @alerts 슬롯의 클릭이 children 슬롯(/fleet/[id])의 내용을 바꾼다
+  await expect(page).toHaveURL(new RegExp(`/fleet/${id}$`))
+  await expect(page.getByRole('complementary', { name: '로봇 상세' })).toBeVisible()
+
+  // 지도는 여전히 같은 인스턴스여야 한다
+  const mapEl = page.getByRole('application', { name: '플릿 관제 지도' })
+  expect(await mapEl.getAttribute('data-map-instance')).toBe('1')
 })

@@ -68,14 +68,23 @@ app/
     page.tsx                        Server — 상세 슬롯 비움 (null) + generateMetadata
     loading.tsx                     Suspense 폴백 (스켈레톤)
     error.tsx                       Client — 에러 바운더리
+    default.tsx                     children 슬롯의 하드 내비게이션 폴백
     [id]/
       page.tsx                      Server — 로봇 상세 + generateMetadata + notFound
       loading.tsx                   상세 패널만 덮는 스켈레톤
       not-found.tsx                 없는 로봇 id
+    @alerts/                        ★ Parallel Route 슬롯 (URL 에 흔적 없음)
+      page.tsx                      /fleet 에서의 경보 레일
+      default.tsx                   /fleet/[id] 등 미매칭 라우트용 — 없으면 레일이 사라진다
+      loading.tsx                   이 레일만 덮는 스켈레톤
+      error.tsx                     이 레일만 덮는 에러 바운더리
     _components/
       SiteInfoPanel.tsx             Server — 정적 사이트 정보
       DetailShell.tsx               Server — 상세 패널 껍데기(3개 상태 공유)
       FleetSkeleton.tsx             Server — 초기 로딩 스켈레톤
+      AlertsSlotContent.tsx         Server — @alerts 슬롯 내용 (page/default 공유)
+      AlertRail.tsx                 Server — 경보 레일 껍데기
+      AlertFeed.tsx                 Client — 실시간 경보 목록
       RobotLiveTelemetry.tsx        Client — 로봇 1대의 실시간 값
       SelectionSync.tsx             Client — URL → 스토어 동기화
       useSelectRobot.ts             Client — 선택 = 스토어 + 라우트 이동
@@ -214,6 +223,35 @@ layout.tsx   헤더 + FleetShell(지도·SSE·사이드바)   ← 유지된다
 **알아둘 것**: `loading.tsx` 는 같은 레벨의 `layout.tsx` 를 덮지 못한다 —
 `page.js` 와 그 하위만 Suspense 로 감싼다. 스냅샷 조회를 레이아웃으로 올렸으므로
 레이아웃 안에 `<Suspense>` 를 직접 두어야 스켈레톤이 보인다.
+
+### 8. Parallel Routes — 경보 레일을 슬롯으로 분리
+
+`app/fleet/@alerts/` 폴더가 이름 있는 슬롯이 되고, 레이아웃이 `children` 과 나란히
+`alerts` prop 으로 받는다. URL 에는 흔적이 없다.
+
+**그냥 컴포넌트를 두는 것과 뭐가 다른가.** 이득은 성능이 아니라 **경계**다.
+
+- 슬롯 전용 `loading.tsx` / `error.tsx` 를 둘 수 있다. 경보 조회가 느리거나 터져도
+  지도와 목록은 멀쩡하다. 관제 화면에서 사이드 패널 하나 때문에 전체를 잃으면 안 된다.
+- 슬롯이 각자 suspend 하므로 준비된 것부터 보인다.
+- 나중에 `@alerts/[alertId]` 같은 하위 라우트를 두면 지도·상세와 무관하게 이 레일만
+  라우팅된다.
+
+반대로 얻지 못하는 것: 슬롯은 같은 라우터·같은 React 트리를 공유하므로 "독립적으로
+리렌더" 되지는 않는다.
+
+**밟은 함정 두 개.** 둘 다 에러 없이 조용히 깨져서 원인을 엉뚱한 곳에서 찾게 된다.
+
+1. **슬롯은 React 트리에서 형제다.** `FleetProvider` 가 `FleetShell` 안에 있는 채로
+   슬롯을 붙이니 슬롯의 `useFleet` 이 컨텍스트를 못 찾고 터졌다. 화면에는
+   `/fleet` 은 레일이 스켈레톤에서 멈추고 `/fleet/[id]` 는 레일이 사라진 것으로
+   보여서, `default.tsx` 를 안 만든 것처럼 읽힌다. 서버 로그를 봐야 안다.
+   → 프로바이더를 레이아웃(슬롯들보다 위)으로 올렸다. 덤으로 두 슬롯이 **하나의
+   SSE 연결**을 공유한다. 슬롯마다 프로바이더를 두면 EventSource 가 두 개 열린다.
+2. **증분 빌드가 새 라우트 파일을 못 잡는다.** `default.tsx` 를 추가한 뒤
+   `yarn build` 를 돌려도 프로덕션에서 계속 레일이 사라졌다. `.next` 를 지우고
+   다시 빌드하니 정상. dev 서버는 처음부터 정상이었다. 라우트 파일을 새로
+   추가했으면 `rm -rf .next` 부터 할 것.
 
 ---
 
@@ -404,6 +442,9 @@ Point.setCoordinates → geometry.changed()          revision++ / 'change'
   변환은 프레임당 갱신된 로봇에 대해서만 한 번 수행한다.
 - **SSE 구독 해제.** `request.signal`의 abort에서 반드시 unsubscribe해야 한다.
   빠뜨리면 시뮬레이터 구독자가 계속 쌓여 메모리 누수가 난다.
+- **`tsconfig.json` 이 `e2e` 를 제외하면 e2e 스펙은 타입 검사를 받지 않는다.**
+  정의하지 않은 헬퍼를 쓴 스펙이 `yarn typecheck` 를 통과해 버렸다. `exclude` 에서
+  빼면 그대로 통과하므로 제외할 이유가 없었다.
 - **스트리밍 중에는 `notFound()` 가 404 를 못 만든다.** `/fleet/없는id` 는 not-found
   패널을 정확히 렌더하지만 HTTP 상태는 **200** 이다. 레이아웃이 `force-dynamic` +
   `<Suspense>` 로 셸을 먼저 흘려보내서, `notFound()` 가 실행될 때 이미 헤더가
@@ -450,7 +491,7 @@ Point.setCoordinates → geometry.changed()          revision++ / 'change'
   그려지긴 하는데 숫자가 안 맞는" 방식으로 실패해서 눈으로 못 잡는다.
 - `e2e/fleet.spec.ts` — 서버 렌더 확인, SSE seq 증가, 선택 연동, 필터, 렌더모드 전환,
   구역 집계·오버레이 토글, 상세 라우트(지도 인스턴스·SSE 유지, 직접 링크, not-found,
-  뒤로가기) (11개)
+  뒤로가기), 경보 레일(하드 내비게이션 포함) (13개)
 
 > `yarn test:e2e` 는 Playwright 번들 브라우저가 필요하다. 처음 실행 전에
 > `yarn playwright install chromium` 을 한 번 돌릴 것.
@@ -462,7 +503,7 @@ Point.setCoordinates → geometry.changed()          revision++ / 'change'
 ## 다음에 붙일 것
 
 - [x] `/fleet/[id]` 상세 라우트 → 아래 "중첩 레이아웃" 절
-- [ ] Parallel Routes로 알림 패널 분리
+- [x] Parallel Routes로 알림 패널 분리 → 아래 "Parallel Routes" 절
 - [ ] 로봇 경로(LineString) 히스토리 레이어
 - [x] 구역 폴리곤 오버레이 + 구역별 집계 → 아래 "구역" 절
 - [ ] Server Actions로 로봇 정지/호출 명령 (여기서 WebSocket 전환 검토)

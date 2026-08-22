@@ -139,6 +139,56 @@ export function summarizeByZone(
   return [...acc.values()]
 }
 
+export interface Alert {
+  robotId: string
+  zone: string
+  kind: 'error' | 'lowBattery'
+  /** 저전력이면 배터리 %, 오류면 0 */
+  battery: number
+}
+
+/**
+ * 경보 목록 — 오류 상태와 저전력을 한 줄로 뽑는다.
+ *
+ * 정렬 규칙이 중요하다. 관제에서 경보 목록은 **위에서부터 읽는** 것이라
+ * 순서가 흔들리면 못 읽는다.
+ *   1) 오류가 저전력보다 먼저 (심각도)
+ *   2) 같은 종류면 배터리 낮은 순 (급한 것부터)
+ *   3) 그래도 같으면 id 순 (안정 정렬 — 값이 같을 때 행이 튀지 않게)
+ *
+ * `limit` 으로 상한을 둔다. 20,000대 플릿에서 오류가 1%만 나도 200줄이고, 그걸
+ * 2.5Hz 로 리렌더하면 경보 패널이 지도의 프레임 예산을 먹는다. 잘린 개수는
+ * 호출자가 total 로 알 수 있으므로 조용히 감추는 게 아니다.
+ */
+export function collectAlerts(
+  robots: Iterable<Robot>,
+  limit = 40,
+): { alerts: Alert[]; totalErrors: number; totalLowBattery: number } {
+  const found: Alert[] = []
+  let totalErrors = 0
+  let totalLowBattery = 0
+
+  for (const r of robots) {
+    if (r.statusCode === 3) {
+      totalErrors++
+      found.push({ robotId: r.id, zone: r.zone, kind: 'error', battery: r.battery })
+    } else if (r.battery < 20) {
+      // 오류인 로봇은 배터리가 낮아도 오류로만 센다. 한 로봇이 두 줄을 차지하면
+      // 경보 개수와 로봇 대수가 안 맞아 헷갈린다.
+      totalLowBattery++
+      found.push({ robotId: r.id, zone: r.zone, kind: 'lowBattery', battery: r.battery })
+    }
+  }
+
+  found.sort((a, b) => {
+    if (a.kind !== b.kind) return a.kind === 'error' ? -1 : 1
+    if (a.battery !== b.battery) return a.battery - b.battery
+    return a.robotId < b.robotId ? -1 : 1
+  })
+
+  return { alerts: found.slice(0, limit), totalErrors, totalLowBattery }
+}
+
 export interface FilterOptions {
   statusFilter: StatusCode | 'all'
   query: string

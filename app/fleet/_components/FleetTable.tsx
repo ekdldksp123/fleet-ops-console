@@ -71,7 +71,10 @@ export default function FleetTable() {
   }, [selectedId])
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
+    // aria-label 을 붙여 이 목록을 이름으로 찾을 수 있게 한다. 경보 레일에도
+    // RB- 로 시작하는 버튼이 있어서, 이름 없이는 "RB- 를 포함한 버튼" 이 두 목록에
+    // 걸쳐 모호해진다(e2e 에서 실제로 문제가 됐다).
+    <section aria-label="로봇 목록" className="flex min-h-0 flex-1 flex-col">
       <div className="flex items-center justify-between px-3 py-1.5 text-[10px] text-slate-500">
         <span>
           {filtered.length.toLocaleString()} / {rows.length.toLocaleString()} 대
@@ -118,7 +121,7 @@ export default function FleetTable() {
       </div>
 
       <StatusLegend />
-    </div>
+    </section>
   )
 }
 
