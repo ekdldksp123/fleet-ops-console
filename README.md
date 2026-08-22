@@ -29,10 +29,18 @@ Next.js 15 **App Router** · React 19 · TypeScript · **OpenLayers** · Zustand
 
 ## 실행
 
+패키지 매니저는 **Yarn 4**(Corepack)이다.
+
 ```bash
-npm install
-npm run dev          # http://localhost:3000/fleet
+yarn install
+yarn dev             # http://localhost:3000/fleet
 ```
+
+> ⚠️ **Yarn PnP 로는 동작하지 않는다.** Tailwind v4 의 postcss 플러그인이 `require` 에
+> `conditions` 옵션을 쓰는데 PnP 가 이를 지원하지 않아, 개발 서버와 프로덕션 빌드가
+> 모두 실패한다(`Some options passed to require() aren't supported by PnP yet`).
+> 그래서 `.yarnrc.yml` 에 `nodeLinker: node-modules` 를 지정해 두었다. 이 파일을
+> 지우면 앱이 뜨지 않는다.
 
 환경변수 (`.env.example` 참고):
 
@@ -42,10 +50,10 @@ FLEET_TICK_MS=100    # 서버 tick 주기
 ```
 
 ```bash
-npm run typecheck    # tsc --noEmit
-npm test             # Vitest 단위 테스트 (24개)
-npm run test:e2e     # Playwright E2E
-npm run build        # 프로덕션 빌드
+yarn typecheck       # tsc --noEmit
+yarn test            # Vitest 단위 테스트 (34개)
+yarn test:e2e        # Playwright E2E
+yarn build           # 프로덕션 빌드
 ```
 
 ---
@@ -134,10 +142,13 @@ FPS·최저 FPS·최장 프레임·수신 지연을 읽는다.
 
 ### 측정 절차
 
-1. `FLEET_SIZE`를 500 → 1000 → 2000 → 5000으로 바꿔가며 `npm run build && npm start`
+1. `FLEET_SIZE`를 2000 → 5000 → 20000으로 바꿔가며 `yarn build && yarn start`
 2. 각 조건에서 Canvas 모드로 30초 방치 후 FPS 기록 (**before**)
 3. WebGL 모드로 전환, 동일하게 30초 후 기록 (**after**)
 4. 지도를 팬·줌하며 최저 FPS도 함께 기록 — 평균만 보면 스터터가 숨는다
+
+> 💡 **2,000대로는 아무 차이도 안 보인다.** 최적화 전에도 60 FPS가 나온다. 차이가
+> 드러나기 시작하는 지점이 20,000대다. 아래 "결과 표 — 최적화 단계" 참고.
 
 > ⚠️ 헤드리스 환경이나 GPU 가속이 꺼진 브라우저에서는 WebGL이 소프트웨어 렌더링
 > (SwiftShader)으로 떨어져 Canvas보다 **느리게** 나온다. 반드시 실제 GPU가 있는
@@ -325,8 +336,14 @@ Point.setCoordinates → geometry.changed()          revision++ / 'change'
 병합은 화면에 뭔가 그려지긴 하는데 값이 미묘하게 틀리는 방식으로 실패하기 때문에
 눈으로는 잡히지 않는다.
 
-- `tests/geo.test.ts` — 알려진 기준값, 왕복 변환, 극지방 클램프
+- `tests/geo.test.ts` — 알려진 기준값, 왕복 변환, 극지방 클램프, 컬링 판정 경계값
 - `tests/delta.test.ts` — seq 역전/중복 방어, 무변경 감지, 미지의 id 노출, 객체 아이덴티티 보존
+- `tests/ol-invariants.test.ts` — **OpenLayers 내부 동작에 대한 가정**을 못 박는다.
+  1단계의 silent 좌표 갱신은 `getFlatCoordinates()`가 복사본이 아니라 내부 배열 그
+  자체를 돌려준다는, 공개 API가 아닌 성질에 기대고 있다. `ol` 업그레이드가 이 가정을
+  깨면 지도는 에러 없이 그냥 얼어붙는다 — 타입으로도 눈으로도 안 잡히는 실패다.
+  그래서 가정 자체를 테스트로 만들었다. 여기가 빨개지면 `FleetMap.tsx`의 갱신 경로를
+  다시 검토해야 한다는 신호다.
 - `e2e/fleet.spec.ts` — 서버 렌더 확인, SSE seq 증가, 선택 연동, 필터, 렌더모드 전환
 
 캔버스 픽셀은 검증하지 않는다. 의미가 없고 깨지기만 한다.
