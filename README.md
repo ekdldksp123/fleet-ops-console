@@ -392,7 +392,11 @@ Point.setCoordinates → geometry.changed()          revision++ / 'change'
 - `tests/zones.test.ts` — 구역 폴리곤의 **타일링**(격자 3,600점으로 빈틈·겹침 탐색)과
   **볼록성**(회전 방향 일관성 + 내부 선분 포함)을 검증한다. 둘 다 깨지면 "지도에 뭔가
   그려지긴 하는데 숫자가 안 맞는" 방식으로 실패해서 눈으로 못 잡는다.
-- `e2e/fleet.spec.ts` — 서버 렌더 확인, SSE seq 증가, 선택 연동, 필터, 렌더모드 전환
+- `e2e/fleet.spec.ts` — 서버 렌더 확인, SSE seq 증가, 선택 연동, 필터, 렌더모드 전환,
+  구역 집계·오버레이 토글 (7개)
+
+> `yarn test:e2e` 는 Playwright 번들 브라우저가 필요하다. 처음 실행 전에
+> `yarn playwright install chromium` 을 한 번 돌릴 것.
 
 캔버스 픽셀은 검증하지 않는다. 의미가 없고 깨지기만 한다.
 
