@@ -17,6 +17,8 @@ export default function RenderModeToggle() {
   const toggleStats = useFleetUi((s) => s.toggleStats)
   const showZones = useFleetUi((s) => s.showZones)
   const toggleZones = useFleetUi((s) => s.toggleZones)
+  const showTrail = useFleetUi((s) => s.showTrail)
+  const toggleTrail = useFleetUi((s) => s.toggleTrail)
 
   return (
     <div className="absolute right-3 top-3 z-10 flex flex-col items-end gap-1.5">
@@ -48,6 +50,9 @@ export default function RenderModeToggle() {
         </MiniToggle>
         <MiniToggle active={showZones} onClick={toggleZones}>
           구역
+        </MiniToggle>
+        <MiniToggle active={showTrail} onClick={toggleTrail}>
+          경로
         </MiniToggle>
         <MiniToggle active={showStats} onClick={toggleStats}>
           계측

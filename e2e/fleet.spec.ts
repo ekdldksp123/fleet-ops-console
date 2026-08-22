@@ -215,3 +215,15 @@ test('경보를 클릭하면 그 로봇의 상세 라우트로 이동한다', as
   const mapEl = page.getByRole('application', { name: '플릿 관제 지도' })
   expect(await mapEl.getAttribute('data-map-instance')).toBe('1')
 })
+
+test('경로 오버레이를 토글할 수 있다', async ({ page }) => {
+  await page.goto('/fleet')
+  await waitForLive(page)
+
+  const toggle = page.getByRole('button', { name: '경로' })
+  await expect(toggle).toHaveAttribute('aria-pressed', 'true')
+  await toggle.click()
+  await expect(toggle).toHaveAttribute('aria-pressed', 'false')
+  await toggle.click()
+  await expect(toggle).toHaveAttribute('aria-pressed', 'true')
+})

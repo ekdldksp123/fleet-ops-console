@@ -22,6 +22,7 @@ interface FleetUiState {
   followSelected: boolean
   showStats: boolean
   showZones: boolean
+  showTrail: boolean
 
   select: (id: string | null) => void
   setStatusFilter: (v: StatusCode | 'all') => void
@@ -30,6 +31,7 @@ interface FleetUiState {
   toggleFollow: () => void
   toggleStats: () => void
   toggleZones: () => void
+  toggleTrail: () => void
 }
 
 export const useFleetUi = create<FleetUiState>((set) => ({
@@ -42,6 +44,7 @@ export const useFleetUi = create<FleetUiState>((set) => ({
   followSelected: true,
   showStats: true,
   showZones: true,
+  showTrail: true,
 
   select: (id) => set({ selectedId: id }),
   setStatusFilter: (statusFilter) => set({ statusFilter }),
@@ -52,4 +55,7 @@ export const useFleetUi = create<FleetUiState>((set) => ({
   // 구역 오버레이는 껐다 켤 수 있어야 한다. 벤치마크할 때 폴리곤 6개의 렌더 비용을
   // 빼고 재려면 필요하고, 로봇이 빽빽한 구역에서는 시야를 가린다.
   toggleZones: () => set((s) => ({ showZones: !s.showZones })),
+  // 경로는 선택된 1대만 그리므로 항상 켜둬도 비용이 없다. 그래도 토글을 두는 이유는
+  // 경로선이 로봇 밀집 구역에서 시야를 가리기 때문이다.
+  toggleTrail: () => set((s) => ({ showTrail: !s.showTrail })),
 }))

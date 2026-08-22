@@ -95,7 +95,7 @@ app/
       LiveStatusBar.tsx             Client — 실시간 집계
       FilterBar.tsx                 Client — 검색·상태 필터
       ZoneStatsPanel.tsx            Client — 구역별 실시간 집계
-      RenderModeToggle.tsx          Client — 벤치마크 스위치
+      RenderModeToggle.tsx          Client — 벤치마크 스위치 + 구역·경로·계측 토글
       StatsOverlay.tsx              Client — FPS·프레임 계측
   api/fleet/stream/route.ts         Route Handler — SSE (ReadableStream)
 
@@ -252,6 +252,26 @@ layout.tsx   헤더 + FleetShell(지도·SSE·사이드바)   ← 유지된다
    `yarn build` 를 돌려도 프로덕션에서 계속 레일이 사라졌다. `.next` 를 지우고
    다시 빌드하니 정상. dev 서버는 처음부터 정상이었다. 라우트 파일을 새로
    추가했으면 `rm -rf .next` 부터 할 것.
+
+### 9. 경로 히스토리 — 선택한 1대만, 상한을 둔다
+
+선택된 로봇의 이동 경로를 `LineString` 레이어로 그린다. 설계 결정이 세 개다.
+
+**1대만 기록한다.** 20,000대 전부의 경로를 들고 있으면 메모리와 렌더 비용이
+`대수 × 점 수` 로 곱해진다. 관제에서 필요한 건 "지금 보고 있는 로봇이 어디서
+왔나" 이므로 1대로 충분하다. 선택한 **순간부터** 기록하고 과거를 소급하지 않는다.
+
+**점 수에 상한을 둔다** (600점 = 10Hz 기준 60초). 이유는 메모리가 아니라 렌더
+비용이다. 무한히 쌓이면 매 프레임 그 전부를 다시 그려야 해서 **오래 켜둘수록
+느려지는 화면**이 된다. 상한이 있으면 비용이 일정하다.
+
+**1단계의 인플레이스 최적화를 여기 적용하지 않았다.** 평범한 배열 + `shift()` +
+`setCoordinates()` 를 쓴다. 점 600개 × 10Hz 는 무시할 비용이고, 그 최적화는 피처가
+2,000개일 때 필요했던 것이다. 같은 기법을 반사적으로 적용하면 코드만 어려워진다 —
+**어디에 쓰지 않을지를 아는 것이 최적화의 절반이다.**
+
+부수 효과로 구역 불변식이 눈에 보인다. 경로가 자기 구역 폴리곤을 벗어나지 않는데,
+그게 "볼록 다각형이면 직선 이동이 구역을 벗어날 수 없다" 는 성질의 시각적 증거다.
 
 ---
 
@@ -491,7 +511,7 @@ Point.setCoordinates → geometry.changed()          revision++ / 'change'
   그려지긴 하는데 숫자가 안 맞는" 방식으로 실패해서 눈으로 못 잡는다.
 - `e2e/fleet.spec.ts` — 서버 렌더 확인, SSE seq 증가, 선택 연동, 필터, 렌더모드 전환,
   구역 집계·오버레이 토글, 상세 라우트(지도 인스턴스·SSE 유지, 직접 링크, not-found,
-  뒤로가기), 경보 레일(하드 내비게이션 포함) (13개)
+  뒤로가기), 경보 레일(하드 내비게이션 포함), 경로 토글 (14개)
 
 > `yarn test:e2e` 는 Playwright 번들 브라우저가 필요하다. 처음 실행 전에
 > `yarn playwright install chromium` 을 한 번 돌릴 것.
@@ -504,6 +524,6 @@ Point.setCoordinates → geometry.changed()          revision++ / 'change'
 
 - [x] `/fleet/[id]` 상세 라우트 → 아래 "중첩 레이아웃" 절
 - [x] Parallel Routes로 알림 패널 분리 → 아래 "Parallel Routes" 절
-- [ ] 로봇 경로(LineString) 히스토리 레이어
+- [x] 로봇 경로(LineString) 히스토리 레이어 → 아래 "경로 히스토리" 절
 - [x] 구역 폴리곤 오버레이 + 구역별 집계 → 아래 "구역" 절
 - [ ] Server Actions로 로봇 정지/호출 명령 (여기서 WebSocket 전환 검토)

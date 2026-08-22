@@ -7,6 +7,7 @@ import Feature from 'ol/Feature'
 import OLMap from 'ol/Map'
 import View from 'ol/View'
 import Point from 'ol/geom/Point'
+import LineString from 'ol/geom/LineString'
 import Polygon from 'ol/geom/Polygon'
 import TileLayer from 'ol/layer/Tile'
 import VectorLayer from 'ol/layer/Vector'
@@ -80,9 +81,22 @@ const CULL_MARGIN_PX = 128
 const Z = {
   TILE: 0,
   ZONE: 1,
-  ROBOTS: 2,
+  TRAIL: 2,
+  ROBOTS: 3,
   SELECTION: 10,
 } as const
+
+/**
+ * 경로에 보관하는 최대 점 수. 10Hz 기준 60초.
+ *
+ * 상한이 필요한 이유는 메모리가 아니라 렌더 비용이다. 점이 무한히 쌓이면 매 프레임
+ * 그 전부를 다시 그려야 해서, 오래 켜둘수록 느려지는 화면이 된다. 상한이 있으면
+ * 비용이 일정하다.
+ *
+ * "선택한 순간부터 60초" 라는 의미도 명확하다 — 관제에서 경로를 보는 이유는 보통
+ * "이 로봇이 방금 어디서 왔나" 라서, 무한 히스토리가 필요하지 않다.
+ */
+const TRAIL_MAX_POINTS = 600
 
 /**
  * 지도 인스턴스 생성 횟수.
@@ -116,6 +130,8 @@ export default function FleetMap() {
   const webglLayerRef = useRef<WebGLPointsLayer<VectorSource<Feature<Point>>> | null>(null)
   const selectionSourceRef = useRef<VectorSource<Feature<Point>> | null>(null)
   const zoneLayerRef = useRef<VectorLayer<VectorSource<Feature<Polygon>>> | null>(null)
+  const trailSourceRef = useRef<VectorSource<Feature<LineString>> | null>(null)
+  const trailLayerRef = useRef<VectorLayer<VectorSource<Feature<LineString>>> | null>(null)
   // 지도 초기화 effect 는 마운트 시 1회만 돌아야 한다. router 를 직접 의존하면
   // 재실행되며 지도가 재생성되므로 ref 로 우회한다.
   const routerRef = useRef(router)
@@ -125,6 +141,7 @@ export default function FleetMap() {
   const selectedId = useFleetUi((s) => s.selectedId)
   const followSelected = useFleetUi((s) => s.followSelected)
   const showZones = useFleetUi((s) => s.showZones)
+  const showTrail = useFleetUi((s) => s.showTrail)
 
   // ── 1. 지도 초기화 (한 번만) ──────────────────────────────────────────────
   useEffect(() => {
@@ -296,6 +313,26 @@ export default function FleetMap() {
     })
     zoneLayerRef.current = zoneLayer
 
+    // ── 경로(LineString) 레이어 ──
+    //
+    // 선택된 로봇 1대의 이동 경로만 그린다. 20,000대 전부의 경로를 들고 있으면
+    // 메모리와 렌더 비용이 대수 × 점 수로 곱해진다 — 관제에서 필요한 건 "지금
+    // 보고 있는 로봇이 어디서 왔나" 이므로 1대로 충분하다.
+    //
+    // 스타일이 두 겹이다. 밝은 지도 타일 위에서 얇은 선 하나는 배경에 묻힌다.
+    // 어두운 넓은 선을 먼저 깔고 그 위에 밝은 선을 얹어 외곽선 효과를 낸다.
+    const trailSource = new VectorSource<Feature<LineString>>({ wrapX: false })
+    trailSourceRef.current = trailSource
+    const trailLayer = new VectorLayer({
+      source: trailSource,
+      style: [
+        new Style({ stroke: new Stroke({ color: 'rgba(2, 6, 23, 0.55)', width: 5 }) }),
+        new Style({ stroke: new Stroke({ color: 'rgba(251, 191, 36, 0.95)', width: 2 }) }),
+      ],
+      zIndex: Z.TRAIL,
+    })
+    trailLayerRef.current = trailLayer
+
     // 선택 강조는 별도의 작은 레이어로 뺀다. 본 레이어를 restyle 하면
     // 2,000개 피처 전체가 다시 그려진다.
     const selectionSource = new VectorSource<Feature<Point>>({ wrapX: false })
@@ -319,6 +356,7 @@ export default function FleetMap() {
       layers: [
         new TileLayer({ source: new OSM(), zIndex: Z.TILE }),
         zoneLayer,
+        trailLayer,
         canvasLayer,
         webglLayer,
         selectionLayer,
@@ -694,7 +732,12 @@ export default function FleetMap() {
     zoneLayerRef.current?.setVisible(showZones)
   }, [showZones])
 
-  // ── 5. 선택 강조 + 추적 ──────────────────────────────────────────────────
+  // ── 5. 경로 오버레이 표시 여부 ────────────────────────────────────────────
+  useEffect(() => {
+    trailLayerRef.current?.setVisible(showTrail)
+  }, [showTrail])
+
+  // ── 6. 선택 강조 + 추적 + 경로 기록 ───────────────────────────────────────
   useEffect(() => {
     const selectionSource = selectionSourceRef.current
     if (!selectionSource) return
@@ -714,15 +757,53 @@ export default function FleetMap() {
       })
     }
 
+    // ── 경로 기록 ──
+    //
+    // 선택한 **순간부터** 기록한다. 과거를 소급해 그리지 않는다 — 전체 로봇의
+    // 히스토리를 상시 보관해야 하고, 그게 이 프로젝트가 피하려는 비용이다.
+    //
+    // 링 버퍼가 아니라 평범한 배열 + shift 를 쓴다. 점 600개에 10Hz 라 O(n) shift
+    // 가 프레임당 600회 이동인데 무시할 수준이다. 1단계의 인플레이스 최적화는
+    // 피처가 2,000개일 때 필요했던 것이고, 여기는 피처 1개다 — 같은 기법을 반사적으로
+    // 적용하면 코드만 어려워진다.
+    const trailSource = trailSourceRef.current
+    const trail: number[][] = []
+    let trailFeature: Feature<LineString> | null = null
+
     // 선택된 1대만 실시간으로 따라간다. 전체를 추적하는 것과 비용이 다르다.
     const unsubscribe = fleet.onFrame(() => {
       const latest = fleet.get(selectedId)
       if (!latest) return
-      marker.getGeometry()?.setCoordinates(toMercator(latest.lon, latest.lat))
+
+      const xy = toMercator(latest.lon, latest.lat)
+      marker.getGeometry()?.setCoordinates(xy)
+
+      if (!trailSource) return
+
+      // 제자리에 멈춰 있는 로봇의 같은 좌표를 계속 넣으면 경로 배열이 의미 없이
+      // 채워져서, 정작 이동 이력이 상한 밖으로 밀려난다.
+      const last = trail[trail.length - 1]
+      if (last && last[0] === xy[0] && last[1] === xy[1]) return
+
+      trail.push(xy)
+      if (trail.length > TRAIL_MAX_POINTS) trail.shift()
+
+      // LineString 은 점이 2개 이상이어야 그릴 수 있다.
+      if (trail.length < 2) return
+      if (!trailFeature) {
+        trailFeature = new Feature({ geometry: new LineString(trail) })
+        trailSource.addFeature(trailFeature)
+      } else {
+        trailFeature.getGeometry()?.setCoordinates(trail)
+      }
     })
+
     return () => {
       unsubscribe()
       selectionSource.clear()
+      // 선택이 바뀌면 경로도 비운다. 안 지우면 이전 로봇의 경로가 남아서
+      // 지금 선택한 로봇이 지나온 길처럼 보인다.
+      trailSource?.clear()
     }
   }, [selectedId, followSelected, fleet])
 
