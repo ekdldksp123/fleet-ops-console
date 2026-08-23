@@ -1,7 +1,7 @@
 'use client'
 
 import { create } from 'zustand'
-import type { ParseMode } from '@/lib/fleet-client'
+import type { FeedMode } from '@/lib/fleet-client'
 import type { StatusCode } from '@/lib/types'
 
 export type RenderMode = 'canvas' | 'webgl'
@@ -24,7 +24,7 @@ interface FleetUiState {
   showStats: boolean
   showZones: boolean
   showTrail: boolean
-  parseMode: ParseMode
+  feedMode: FeedMode
 
   select: (id: string | null) => void
   setStatusFilter: (v: StatusCode | 'all') => void
@@ -34,7 +34,7 @@ interface FleetUiState {
   toggleStats: () => void
   toggleZones: () => void
   toggleTrail: () => void
-  setParseMode: (v: ParseMode) => void
+  setFeedMode: (v: FeedMode) => void
 }
 
 export const useFleetUi = create<FleetUiState>((set) => ({
@@ -49,7 +49,7 @@ export const useFleetUi = create<FleetUiState>((set) => ({
   showZones: true,
   showTrail: true,
   // 기본을 'main' 으로 두는 것도 의도적이다. 벤치마크의 before 가 기본 상태여야 한다.
-  parseMode: 'main',
+  feedMode: 'main',
 
   select: (id) => set({ selectedId: id }),
   setStatusFilter: (statusFilter) => set({ statusFilter }),
@@ -63,5 +63,5 @@ export const useFleetUi = create<FleetUiState>((set) => ({
   // 경로는 선택된 1대만 그리므로 항상 켜둬도 비용이 없다. 그래도 토글을 두는 이유는
   // 경로선이 로봇 밀집 구역에서 시야를 가리기 때문이다.
   toggleTrail: () => set((s) => ({ showTrail: !s.showTrail })),
-  setParseMode: (parseMode) => set({ parseMode }),
+  setFeedMode: (feedMode) => set({ feedMode }),
 }))

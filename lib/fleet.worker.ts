@@ -25,6 +25,7 @@
  * 되돌려주고 여기서 풀에 넣는다. 정상 상태에서 할당이 0이 된다.
  */
 
+import { BinaryFeed } from './binary-feed'
 import {
   bufferCapacity,
   createFrameBuffers,
@@ -35,9 +36,11 @@ import {
   type FrameBuffers,
   type PackedFrame,
 } from './frame-codec'
+import { copyFrameInto } from './wire-format'
 
 export type WorkerRequest =
-  | { type: 'start'; url: string; ids: string[] }
+  /** encoding: 'json' = SSE + JSON.parse, 'binary' = fetch 스트림 + 바이트 복사 */
+  | { type: 'start'; url: string; ids: string[]; encoding: 'json' | 'binary' }
   | { type: 'stop' }
   /** 메인 스레드가 다 쓴 버퍼를 되돌려준다. 이 네 개도 transfer 로 온다. */
   | {
@@ -54,6 +57,7 @@ export type WorkerResponse =
   | { type: 'frame'; packed: PackedFrame }
 
 let source: EventSource | null = null
+let feed: BinaryFeed | null = null
 let idToIndex = new Map<string, number>()
 
 /**
@@ -89,9 +93,48 @@ const post = (msg: WorkerResponse, transfer?: ArrayBuffer[]) => {
 function stop() {
   source?.close()
   source = null
+  feed?.stop()
+  feed = null
   // 풀은 비운다. 연결이 끊긴 뒤에도 들고 있으면 플릿 크기가 바뀐 재연결에서
   // 낡은 용량의 세트를 재사용하게 된다.
   pool.length = 0
+}
+
+/**
+ * 이진 스트림 경로 — **파싱이 없다.**
+ *
+ * JSON 경로는 문자열을 파싱해 객체 배열을 만들고 다시 타입 배열로 담는다. 여기서는
+ * 서버가 이미 이진으로 보내므로 정렬된 풀 버퍼로 **바이트를 복사**만 한다.
+ * 요소별 루프도 없고 중간 객체도 없다 — memcpy 네 번이다.
+ */
+function startBinary(url: string) {
+  feed = new BinaryFeed(url, {
+    onState: (state) => post({ type: 'state', state }),
+    onFrame: (bytes, offset, header) => {
+      const buffers = takeBuffers()
+      const allocated = !buffers || bufferCapacity(buffers) < header.count
+      const buf = allocated ? createFrameBuffers(Math.max(header.count, 1)) : buffers!
+
+      copyFrameInto(bytes, offset, header, buf)
+
+      const packed: PackedFrame = {
+        seq: header.seq,
+        t: header.t,
+        count: header.count,
+        unknown: 0,
+        // 이진 프레임의 실제 전송 바이트 수. JSON 경로의 문자열 길이와 같은 자리에
+        // 두어 계측 오버레이에서 두 인코딩의 크기를 직접 비교할 수 있다.
+        payloadBytes: header.byteLength,
+        allocated,
+        idx: buf.idx.subarray(0, header.count),
+        lonLat: buf.lonLat.subarray(0, header.count * 2),
+        status: buf.status.subarray(0, header.count),
+        battery: buf.battery.subarray(0, header.count),
+      }
+      post({ type: 'frame', packed }, transferables(packed))
+    },
+  })
+  feed.start()
 }
 
 self.onmessage = (event: MessageEvent<WorkerRequest>) => {
@@ -115,6 +158,11 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
   idToIndex = new Map(msg.ids.map((id, i) => [id, i]))
   capacity = msg.ids.length
   post({ type: 'state', state: 'connecting' })
+
+  if (msg.encoding === 'binary') {
+    startBinary(msg.url)
+    return
+  }
 
   const es = new EventSource(msg.url)
   source = es

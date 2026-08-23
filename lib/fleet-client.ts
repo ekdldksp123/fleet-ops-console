@@ -2,21 +2,30 @@
 
 import { applyDelta } from './delta'
 import { applyPackedFrame, type PackedFrame } from './frame-codec'
+import { IS_LITTLE_ENDIAN } from './wire-format'
 import type { WorkerRequest, WorkerResponse } from './fleet.worker'
 import type { DeltaFrame, FleetMeta, Robot } from './types'
 
 export type ConnectionState = 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed'
 
 /**
- * 델타 파싱을 어디서 하는가.
+ * 델타를 어떤 경로로 받는가. 세 방식이 **같은 데이터**를 다르게 실어 온다.
  *
- *   'main'   : 메인 스레드에서 EventSource + JSON.parse (기본값)
- *   'worker' : 워커가 EventSource 를 소유하고 파싱까지 한 뒤 이진 프레임만 전송
+ *   'main'   : 메인 스레드에서 SSE + JSON.parse                    (기본값 = before)
+ *   'worker' : 워커가 SSE + JSON.parse, 이진 프레임만 메인으로 전송
+ *   'binary' : 서버가 이진으로 보내고 워커는 바이트 복사만 — **파싱 없음**
+ *
+ * 앞의 둘은 "JSON 을 어디서 파싱할까" 를 다루고, 마지막은 "JSON 을 아예 안 쓴다" 다.
+ * 세 방식을 나란히 둔 이유는 A/B 측정이다 — 데이터가 같아야 인코딩·스레드 차이만
+ * 비교할 수 있다.
  *
  * 기본을 'main' 으로 두는 건 의도적이다 — 벤치마크의 "before" 가 기본 상태여야
  * 개선 폭이 정직하게 드러난다(렌더 모드 토글과 같은 원칙).
  */
-export type ParseMode = 'main' | 'worker'
+export type FeedMode = 'main' | 'worker' | 'binary'
+
+/** @deprecated 이진 모드가 추가되며 FeedMode 로 이름이 바뀌었다. */
+export type ParseMode = FeedMode
 
 export interface FrameStats {
   seq: number
@@ -83,8 +92,10 @@ export class FleetClient {
   private frameListeners = new Set<FrameListener>()
   private stateListeners = new Set<StateListener>()
 
-  parseMode: ParseMode = 'main'
+  feedMode: FeedMode = 'main'
   private url = '/api/fleet/stream'
+  /** 이진 스트림 라우트. SSE 라우트와 같은 데이터를 다른 인코딩으로 낸다. */
+  private binaryUrl = '/api/fleet/binary'
   /** 워커가 버퍼를 새로 할당한 누적 횟수. 풀링 동작 확인용. */
   private bufferAllocs = 0
 
@@ -118,7 +129,13 @@ export class FleetClient {
     this.url = url
     if (this.source || this.worker) return
 
-    if (this.parseMode === 'worker' && typeof Worker !== 'undefined') {
+    if (this.feedMode !== 'main' && typeof Worker !== 'undefined') {
+      // 빅 엔디언 플랫폼에서는 이진 페이로드의 요소 해석이 뒤집힌다. 조용히 틀리는
+      // 것보다 JSON 경로로 물러나는 쪽이 낫다(lib/wire-format.ts 주석 참고).
+      if (this.feedMode === 'binary' && !IS_LITTLE_ENDIAN) {
+        console.warn('[FleetClient] 빅 엔디언 플랫폼 — 이진 모드를 쓸 수 없어 워커 JSON 으로 갑니다')
+        this.feedMode = 'worker'
+      }
       this.connectViaWorker()
       return
     }
@@ -132,10 +149,10 @@ export class FleetClient {
    * 서버 seq 는 계속 증가하므로 이후 프레임이 버려지지는 않는다. 사람이 토글을
    * 누르는 빈도의 동작이라 이 정도 대가는 감당할 만하다.
    */
-  setParseMode(mode: ParseMode) {
-    if (mode === this.parseMode) return
+  setFeedMode(mode: FeedMode) {
+    if (mode === this.feedMode) return
     const wasConnected = Boolean(this.source || this.worker)
-    this.parseMode = mode
+    this.feedMode = mode
     // 전환할 때 리셋한다. 안 하면 이전 모드의 누적치가 남아 풀링 판단을 흐린다.
     this.bufferAllocs = 0
     if (!wasConnected) return
@@ -211,11 +228,17 @@ export class FleetClient {
       console.error('[FleetClient] 워커 오류, 메인 스레드로 폴백합니다', err)
       // 워커가 죽어도 화면이 멈추면 안 된다. 조용히 메인 경로로 되돌린다.
       this.teardown()
-      this.parseMode = 'main'
+      this.feedMode = 'main'
       this.connectOnMainThread()
     }
 
-    const req: WorkerRequest = { type: 'start', url: this.url, ids: this.indexToId }
+    const encoding = this.feedMode === 'binary' ? 'binary' : 'json'
+    const req: WorkerRequest = {
+      type: 'start',
+      url: encoding === 'binary' ? this.binaryUrl : this.url,
+      ids: this.indexToId,
+      encoding,
+    }
     worker.postMessage(req)
   }
 

@@ -58,6 +58,7 @@ class FleetSimulator {
    * 클라이언트가 알아야 할 것은 다 알고 있다.
    */
   private halted = new Set<string>()
+  private idIndexCache: Map<string, number> | null = null
   private subscribers = new Set<Subscriber>()
   private timer: ReturnType<typeof setInterval> | null = null
   private seq = 0
@@ -151,6 +152,23 @@ class FleetSimulator {
   /** 초기 스냅샷. Server Component 가 직접 호출한다 (HTTP 왕복 없음). */
   snapshot(): Robot[] {
     return this.robots.map((r) => ({ ...r }))
+  }
+
+  /**
+   * id → 인덱스 표. 이진 스트림이 id 대신 인덱스를 실어 보내는 데 쓴다.
+   *
+   * 순서는 `snapshot()` 과 같다 — 클라이언트도 초기 스냅샷 순서로 표를 만들기
+   * 때문에 양쪽 인덱스가 일치한다. 여기서 순서가 어긋나면 로봇 좌표가 서로 뒤바뀌고,
+   * 에러 없이 지도만 이상해진다.
+   *
+   * 연결마다 다시 만들면 60,000개 Map 을 매번 짓는다. 플릿이 고정이므로 한 번만
+   * 만들어 들고 있는다.
+   */
+  idIndex(): ReadonlyMap<string, number> {
+    if (!this.idIndexCache) {
+      this.idIndexCache = new Map(this.robots.map((r, i) => [r.id, i]))
+    }
+    return this.idIndexCache
   }
 
   /**
