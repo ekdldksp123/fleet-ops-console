@@ -105,6 +105,26 @@ export const SITE_EXTENT: Extent = { minLon: X0, minLat: Y0, maxLon: X3, maxLat:
 export const ZONE_EXTENTS: readonly Extent[] = ZONES.map((z) => ringExtent(z.ring))
 
 /**
+ * 구역의 집결지 — 정점 좌표의 평균.
+ *
+ * **볼록 다각형에서는 정점의 평균이 항상 내부에 있다.** 그래서 이 점을 웨이포인트로
+ * 주면 로봇이 구역 밖으로 나가지 않는다(로봇은 직선 이동한다). 오목 다각형이면
+ * 정점 평균이 폴리곤 밖일 수 있어서 이 함수 자체가 성립하지 않는다 — ZONES 의
+ * 볼록성 불변식이 여기서 한 번 더 값을 한다.
+ *
+ * "호출" 명령(app/fleet/_actions.ts)이 이 좌표를 목표로 쓴다.
+ */
+export function zoneRallyPoint(zone: Zone): LonLat {
+  let lon = 0
+  let lat = 0
+  for (const [x, y] of zone.ring) {
+    lon += x
+    lat += y
+  }
+  return [lon / zone.ring.length, lat / zone.ring.length]
+}
+
+/**
  * 점이 속한 구역. 사이트 밖이면 null.
  *
  * 시뮬레이터가 거부 표집 검증에 쓰고, 테스트가 타일링 불변식 확인에 쓴다.

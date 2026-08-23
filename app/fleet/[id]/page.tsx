@@ -7,6 +7,7 @@ import { STATUS_LABELS } from '@/lib/types'
 import { ZONES } from '@/lib/zones'
 
 import DetailShell from '../_components/DetailShell'
+import RobotCommands from '../_components/RobotCommands'
 import RobotLiveTelemetry from '../_components/RobotLiveTelemetry'
 import SelectionSync from '../_components/SelectionSync'
 
@@ -23,6 +24,9 @@ import SelectionSync from '../_components/SelectionSync'
  *
  *  ✅ 서버: id·이름·소속 구역·구역 정점 수 같은 **안 변하는 값**, generateMetadata
  *  ❌ 서버: 좌표·상태·배터리 — 10Hz 로 변하므로 RobotLiveTelemetry(Client)가 맡는다
+ *
+ * 제어 버튼(RobotCommands)은 Server Action 을 호출한다. 명령은 요청/응답, 결과 반영은
+ * 스트림 — 왜 그렇게 나눴는지는 app/fleet/_actions.ts 주석 참고.
  *
  * 서버에서 실시간 값을 그리면 새로고침해야 갱신되는 죽은 화면이 된다. 반대로
  * 신원 정보를 클라이언트로 내리면 번들만 커진다.
@@ -83,6 +87,9 @@ export default async function RobotDetailPage({ params }: { params: Params }) {
 
       {/* ── 클라이언트 렌더: 10Hz 로 변하는 값 ── */}
       <RobotLiveTelemetry id={robot.id} />
+
+      {/* ── 제어: Server Action 으로 명령, 결과는 SSE 로 확인 ── */}
+      <RobotCommands id={robot.id} />
 
       <p className="border-t border-slate-800 px-3 py-2 text-[9px] leading-relaxed text-slate-600">
         이 패널만 라우트 전환으로 교체됩니다. 지도 인스턴스와 SSE 연결은

@@ -2,7 +2,7 @@ import 'server-only'
 
 import { pointInRing } from './geo'
 import type { DeltaFrame, FleetMeta, Robot, RobotDelta, StatusCode } from './types'
-import { ZONES, ZONE_EXTENTS } from './zones'
+import { ZONES, ZONE_EXTENTS, zoneRallyPoint } from './zones'
 
 /**
  * 서버 사이드 플릿 시뮬레이터.
@@ -49,6 +49,15 @@ class FleetSimulator {
   private waypoints: Waypoint[] = []
   /** 로봇이 어느 구역 소속인지. 새 웨이포인트를 같은 구역에서 뽑기 위해 들고 있다. */
   private zoneIndexById = new Map<string, number>()
+  /**
+   * 정지 명령을 받은 로봇.
+   *
+   * 서버에만 있는 상태다. Robot 타입이나 델타 튜플에 넣지 않는다 — 튜플 형식
+   * [id, lon, lat, statusCode, battery] 을 바꾸면 대역폭이 늘고 클라이언트 파서도
+   * 같이 고쳐야 한다. 정지의 **결과**(statusCode 0)는 이미 델타로 전달되므로
+   * 클라이언트가 알아야 할 것은 다 알고 있다.
+   */
+  private halted = new Set<string>()
   private subscribers = new Set<Subscriber>()
   private timer: ReturnType<typeof setInterval> | null = null
   private seq = 0
@@ -159,6 +168,62 @@ class FleetSimulator {
     return found ? { ...found } : undefined
   }
 
+  /**
+   * 로봇 명령 — /fleet 의 Server Action 이 호출한다.
+   *
+   * 실제 시스템에서는 이 자리가 로봇 게이트웨이로 나가는 MQTT publish 나 gRPC
+   * 호출이다. 여기서는 시뮬레이터 상태를 직접 바꾼다.
+   *
+   * 반환값이 boolean 인 이유: Server Action 은 공개 엔드포인트다. 없는 id 가 오면
+   * 조용히 무시하지 말고 호출자에게 알려서 UI 가 실패를 표시하게 한다.
+   *
+   * 명령의 **결과**는 다음 tick 의 델타로 SSE 를 타고 클라이언트에 도달한다.
+   * 그래서 Server Action 이 revalidatePath 를 부를 필요가 없다 — 읽기 경로가
+   * 캐시가 아니라 스트림이다.
+   */
+  command(id: string, kind: 'halt' | 'recall'): boolean {
+    const robot = this.byId.get(id)
+    if (!robot) return false
+
+    if (kind === 'halt') {
+      this.halted.add(id)
+      robot.statusCode = 0 // 대기
+    } else {
+      this.halted.delete(id)
+      // 자기 구역의 집결지로 보낸다. 볼록 폴리곤의 정점 평균이라 항상 구역 내부이고,
+      // 로봇이 직선으로 가도 구역을 벗어나지 않는다(lib/zones.ts zoneRallyPoint).
+      //
+      // 다른 구역으로 부르지 않는 이유: 구역을 넘어가는 직선 이동은 중간에 남의
+      // 구역을 지나므로 "로봇의 구역 라벨과 위치가 일치한다" 는 불변식이 깨진다.
+      const zoneIndex = this.zoneIndexById.get(id) ?? 0
+      const [lon, lat] = zoneRallyPoint(ZONES[zoneIndex])
+      const robotIndex = this.robots.indexOf(robot)
+      if (robotIndex >= 0) this.waypoints[robotIndex] = { lon, lat }
+      robot.statusCode = 1 // 이동중
+    }
+
+    // 다음 tick 을 기다리지 않고 즉시 델타를 흘려보낸다. 명령의 반응이 최대 tickMs
+    // 만큼 늦어지면 버튼이 둔하게 느껴진다.
+    const frame: DeltaFrame = {
+      t: Date.now(),
+      seq: ++this.seq,
+      updates: [[robot.id, robot.lon, robot.lat, robot.statusCode, robot.battery]],
+    }
+    for (const fn of this.subscribers) {
+      try {
+        fn(frame)
+      } catch {
+        /* 구독자 하나가 죽어도 나머지 스트림은 유지한다 */
+      }
+    }
+    return true
+  }
+
+  /** 정지 명령을 받은 상태인지. 상세 패널이 버튼 상태를 정하는 데 쓴다. */
+  isHalted(id: string): boolean {
+    return this.halted.has(id)
+  }
+
   subscribe(fn: Subscriber): () => void {
     this.subscribers.add(fn)
     this.start()
@@ -212,7 +277,9 @@ class FleetSimulator {
         if (r.battery >= 99) r.statusCode = 1
         touched = true
       } else if (r.statusCode === 0) {
-        if (this.rand() < 0.06) {
+        // 정지 명령을 받은 로봇은 스스로 깨어나지 않는다. 이게 없으면 "정지" 를
+        // 눌러도 몇 초 뒤 알아서 움직여서 명령이 먹지 않는 것처럼 보인다.
+        if (!this.halted.has(r.id) && this.rand() < 0.06) {
           r.statusCode = r.battery < 25 ? 2 : 1
           touched = true
         }
@@ -221,6 +288,13 @@ class FleetSimulator {
           r.statusCode = 0 // 복구
           touched = true
         }
+      }
+
+      // 정지 중인 로봇은 아래 자동 전환에서도 빼준다. 명령이 조용히 덮이면
+      // 사용자는 버튼이 안 먹는다고 판단한다.
+      if (this.halted.has(r.id)) {
+        if (touched) updates.push([r.id, r.lon, r.lat, r.statusCode, r.battery])
+        continue
       }
 
       // 저배터리면 충전으로, 아주 낮은 확률로 오류 발생

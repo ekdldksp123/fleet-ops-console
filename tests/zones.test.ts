@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { pointInRing } from '@/lib/geo'
-import { SITE_EXTENT, ZONES, ZONE_EXTENTS, ZONE_NAMES, zoneAt } from '@/lib/zones'
+import { SITE_EXTENT, ZONES, ZONE_EXTENTS, ZONE_NAMES, zoneAt, zoneRallyPoint } from '@/lib/zones'
 
 /**
  * 구역 폴리곤의 타일링 불변식.
@@ -194,6 +194,38 @@ describe('구역 내 위치 표집', () => {
       expect(ratio, `${zone.name} 의 bbox 대비 면적비 ${(ratio * 100).toFixed(1)}%`).toBeGreaterThan(
         0.2,
       )
+    }
+  })
+})
+
+describe('구역 집결지', () => {
+  it('모든 구역의 집결지가 그 구역 내부에 있다', () => {
+    // "호출" 명령이 이 좌표를 웨이포인트로 준다. 폴리곤 밖이면 로봇이 자기 구역을
+    // 벗어나고 구역 라벨과 위치가 어긋난다. 볼록성 덕에 정점 평균이 내부다.
+    for (const zone of ZONES) {
+      const [lon, lat] = zoneRallyPoint(zone)
+      expect(pointInRing(zone.ring, lon, lat), `${zone.name} 집결지가 구역 밖이다`).toBe(true)
+      expect(zoneAt(lon, lat)?.name).toBe(zone.name)
+    }
+  })
+
+  it('집결지에서 구역 내 임의의 점까지 직선 경로가 구역을 벗어나지 않는다', () => {
+    // 호출받은 로봇은 현재 위치에서 집결지로 직선 이동한다.
+    for (let zi = 0; zi < ZONES.length; zi++) {
+      const zone = ZONES[zi]
+      const e = ZONE_EXTENTS[zi]
+      const [rx, ry] = zoneRallyPoint(zone)
+      for (let i = 1; i < 10; i++) {
+        for (let j = 1; j < 10; j++) {
+          const lon = e.minLon + (i / 10) * (e.maxLon - e.minLon)
+          const lat = e.minLat + (j / 10) * (e.maxLat - e.minLat)
+          if (!pointInRing(zone.ring, lon, lat)) continue
+          for (let t = 1; t < 8; t++) {
+            const k = t / 8
+            expect(pointInRing(zone.ring, lon + (rx - lon) * k, lat + (ry - lat) * k)).toBe(true)
+          }
+        }
+      }
     }
   })
 })

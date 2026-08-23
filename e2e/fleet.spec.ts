@@ -227,3 +227,31 @@ test('경로 오버레이를 토글할 수 있다', async ({ page }) => {
   await toggle.click()
   await expect(toggle).toHaveAttribute('aria-pressed', 'true')
 })
+
+/**
+ * Server Actions 로 보내는 제어 명령.
+ *
+ * 검증의 핵심은 "정지가 **유지되는가**" 다. 시뮬레이터는 대기 상태에서 100ms 마다
+ * 6% 확률로 스스로 깨어나므로, 정지 명령이 그 자동 기상을 막지 못하면 1~2초 안에
+ * 다시 이동중이 된다 — 버튼이 먹은 것처럼 보였다가 조용히 풀린다.
+ */
+test('정지 명령이 유지되고 호출로 다시 움직인다', async ({ page }) => {
+  await page.goto('/fleet/RB-00003')
+  await waitForLive(page)
+
+  const panel = page.getByRole('complementary', { name: '로봇 상세' })
+  const status = async () =>
+    ((await panel.textContent()) ?? '').replace(/\s+/g, '').match(/(대기|이동중|충전중|오류)실시간/)?.[1]
+
+  await page.getByRole('button', { name: '정지' }).click()
+  await expect(panel.locator('[aria-live]')).toHaveText('정지 명령을 보냈습니다')
+  await expect.poll(status, { timeout: 5_000 }).toBe('대기')
+
+  // 자동 기상을 막고 있는지. 6%/100ms 라면 5초 안에 거의 확실히 깨어난다.
+  await page.waitForTimeout(5_000)
+  expect(await status(), '정지가 풀렸다 — 시뮬레이터의 halted 처리를 확인할 것').toBe('대기')
+
+  await page.getByRole('button', { name: '집결지 호출' }).click()
+  await expect(panel.locator('[aria-live]')).toHaveText('구역 집결지로 호출했습니다')
+  await expect.poll(status, { timeout: 5_000 }).toBe('이동중')
+})
