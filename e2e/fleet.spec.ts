@@ -255,3 +255,44 @@ test('정지 명령이 유지되고 호출로 다시 움직인다', async ({ pag
   await expect(panel.locator('[aria-live]')).toHaveText('구역 집결지로 호출했습니다')
   await expect.poll(status, { timeout: 5_000 }).toBe('이동중')
 })
+
+/**
+ * 델타 파싱 위치(메인/워커) 전환.
+ *
+ * 검증의 핵심은 "전환 후에도 스트림이 계속 흐르는가" 다. 워커 경로는 EventSource 를
+ * 워커가 소유하고 이진 프레임을 transfer 로 넘기므로, 코덱이 어긋나면 화면이 조용히
+ * 멈춘다 — 에러 없이 seq 만 안 올라간다.
+ */
+test('워커 파싱으로 전환해도 스트림이 계속 흐른다', async ({ page }) => {
+  const errors: string[] = []
+  page.on('pageerror', (e) => errors.push(String(e)))
+
+  await page.goto('/fleet')
+  await waitForLive(page)
+
+  const seq = async () => {
+    const t = await page.locator('text=프레임 seq').locator('..').locator('span').last().textContent()
+    return Number(t)
+  }
+  const before = await seq()
+
+  await page.getByRole('radio', { name: '워커 파싱' }).click()
+  await expect(page.getByRole('radio', { name: '워커 파싱' })).toHaveAttribute('aria-checked', 'true')
+  // 워커가 새로 연결하는 동안 잠깐 끊기므로 다시 기다린다
+  await waitForLive(page)
+
+  // seq 가 계속 오르면 워커 → 메인 이진 경로가 살아 있다는 뜻이다
+  await expect.poll(seq, { timeout: 10_000 }).toBeGreaterThan(before)
+
+  // 지도도 계속 갱신되어야 한다 (갱신 대수가 0이 아니다)
+  const changed = await page.locator('text=갱신 대수').locator('..').locator('span').last().textContent()
+  expect(Number((changed ?? '0').replace(/,/g, ''))).toBeGreaterThan(0)
+
+  // 메인으로 되돌려도 정상
+  await page.getByRole('radio', { name: '메인 파싱' }).click()
+  await waitForLive(page)
+  const afterBack = await seq()
+  await expect.poll(seq, { timeout: 10_000 }).toBeGreaterThan(afterBack)
+
+  expect(errors, `페이지 에러: ${errors.join(' | ')}`).toHaveLength(0)
+})

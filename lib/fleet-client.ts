@@ -1,9 +1,22 @@
 'use client'
 
 import { applyDelta } from './delta'
+import { applyPackedFrame, type PackedFrame } from './frame-codec'
+import type { WorkerRequest, WorkerResponse } from './fleet.worker'
 import type { DeltaFrame, FleetMeta, Robot } from './types'
 
 export type ConnectionState = 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed'
+
+/**
+ * 델타 파싱을 어디서 하는가.
+ *
+ *   'main'   : 메인 스레드에서 EventSource + JSON.parse (기본값)
+ *   'worker' : 워커가 EventSource 를 소유하고 파싱까지 한 뒤 이진 프레임만 전송
+ *
+ * 기본을 'main' 으로 두는 건 의도적이다 — 벤치마크의 "before" 가 기본 상태여야
+ * 개선 폭이 정직하게 드러난다(렌더 모드 토글과 같은 원칙).
+ */
+export type ParseMode = 'main' | 'worker'
 
 export interface FrameStats {
   seq: number
@@ -12,6 +25,20 @@ export interface FrameStats {
   latencyMs: number
   droppedFrames: number
   unknownIds: number
+  /**
+   * 이 프레임을 삼키는 데 **메인 스레드가** 쓴 시간(ms).
+   *
+   * 메인 스레드 모드에서는 JSON.parse + applyDelta 를 모두 포함한다.
+   * 워커 모드에서는 파싱이 워커에서 끝나므로 타입배열 적용 시간만 남는다.
+   * 두 값의 차이가 곧 "워커로 옮긴 일의 양" 이다.
+   *
+   * 프레임 예산(60fps 기준 16.6ms)과 직접 비교할 수 있는 숫자라서, 파싱이 정말
+   * 메인 스레드를 막고 있는지 판단하는 근거가 된다. README 가 이 확인을
+   * Web Worker 착수의 전제조건으로 걸어 두었다.
+   */
+  ingestMs: number
+  /** 페이로드 크기(bytes). 파싱 비용의 원인을 크기와 함께 봐야 판단이 된다. */
+  payloadBytes: number
 }
 
 type FrameListener = (changed: readonly string[], stats: FrameStats) => void
@@ -45,11 +72,27 @@ export class FleetClient {
   lastFrameAt = 0
 
   private source: EventSource | null = null
+  private worker: Worker | null = null
   private frameListeners = new Set<FrameListener>()
   private stateListeners = new Set<StateListener>()
 
+  parseMode: ParseMode = 'main'
+  private url = '/api/fleet/stream'
+
+  /**
+   * 인덱스 ↔ id 표. 이진 프레임이 id 대신 인덱스를 담기 때문에 필요하다.
+   *
+   * 생성자에서 한 번 만든다. 플릿 구성이 시작 시점에 고정이라는 가정에 기대고 있고,
+   * 그 가정이 깨지면(런타임에 로봇이 추가되면) 미지의 인덱스가 unknown 으로 잡혀
+   * 드러난다 — 조용히 틀리지는 않는다.
+   */
+  private readonly indexToId: string[] = []
+
   constructor(initial: readonly Robot[], meta?: FleetMeta) {
-    for (const r of initial) this.robots.set(r.id, { ...r })
+    for (const r of initial) {
+      this.robots.set(r.id, { ...r })
+      this.indexToId.push(r.id)
+    }
     this.meta = meta ?? null
   }
 
@@ -62,11 +105,37 @@ export class FleetClient {
     return this.robots.get(id)
   }
 
-  connect(url = '/api/fleet/stream') {
-    if (this.source) return
+  connect(url = this.url) {
+    this.url = url
+    if (this.source || this.worker) return
+
+    if (this.parseMode === 'worker' && typeof Worker !== 'undefined') {
+      this.connectViaWorker()
+      return
+    }
+    this.connectOnMainThread()
+  }
+
+  /**
+   * 파싱 위치를 바꾼다. 연결을 끊고 새 전송 방식으로 다시 연결한다.
+   *
+   * 재연결 중 몇 프레임을 놓칠 수 있다. 델타 방식이라 놓친 만큼 위치가 튀지만,
+   * 서버 seq 는 계속 증가하므로 이후 프레임이 버려지지는 않는다. 사람이 토글을
+   * 누르는 빈도의 동작이라 이 정도 대가는 감당할 만하다.
+   */
+  setParseMode(mode: ParseMode) {
+    if (mode === this.parseMode) return
+    const wasConnected = Boolean(this.source || this.worker)
+    this.parseMode = mode
+    if (!wasConnected) return
+    this.teardown()
+    this.connect()
+  }
+
+  private connectOnMainThread() {
     this.setState('connecting')
 
-    const es = new EventSource(url)
+    const es = new EventSource(this.url)
     this.source = es
 
     es.addEventListener('meta', (event) => {
@@ -80,13 +149,17 @@ export class FleetClient {
     es.onopen = () => this.setState('open')
 
     es.onmessage = (event) => {
+      // 계측은 JSON.parse 를 **포함**해야 의미가 있다. 파싱이 이 경로의 주 비용일
+      // 수 있다는 게 검증할 가설이므로, 파싱 밖에서 재면 가설을 비껴간다.
+      const t0 = performance.now()
+      const data = event.data as string
       let frame: DeltaFrame
       try {
-        frame = JSON.parse(event.data) as DeltaFrame
+        frame = JSON.parse(data) as DeltaFrame
       } catch {
         return
       }
-      this.ingest(frame)
+      this.ingest(frame, t0, data.length)
     }
 
     es.onerror = () => {
@@ -95,13 +168,87 @@ export class FleetClient {
     }
   }
 
-  disconnect() {
+  /**
+   * 워커 경로. 파싱은 워커가 하고 메인 스레드는 이진 프레임만 적용한다.
+   *
+   * `new URL(..., import.meta.url)` 형태는 webpack 5 / Turbopack 이 워커 번들로
+   * 인식하는 표준 구문이다. 문자열 경로를 쓰면 번들러가 추적하지 못해 프로덕션에서
+   * 404 가 난다.
+   */
+  private connectViaWorker() {
+    this.setState('connecting')
+
+    const worker = new Worker(new URL('./fleet.worker.ts', import.meta.url))
+    this.worker = worker
+
+    worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
+      const msg = event.data
+      if (msg.type === 'state') {
+        this.setState(msg.state)
+        return
+      }
+      if (msg.type === 'meta') {
+        this.meta = msg.meta as FleetMeta
+        return
+      }
+      // 메인 스레드에서 재는 시간은 여기서 시작한다. JSON.parse 는 이미 워커에서
+      // 끝났으므로 이 값에 포함되지 않는다 — 그 차이가 곧 옮긴 일의 양이다.
+      this.ingestPacked(msg.packed, performance.now())
+    }
+
+    worker.onerror = (err) => {
+      console.error('[FleetClient] 워커 오류, 메인 스레드로 폴백합니다', err)
+      // 워커가 죽어도 화면이 멈추면 안 된다. 조용히 메인 경로로 되돌린다.
+      this.teardown()
+      this.parseMode = 'main'
+      this.connectOnMainThread()
+    }
+
+    const req: WorkerRequest = { type: 'start', url: this.url, ids: this.indexToId }
+    worker.postMessage(req)
+  }
+
+  private teardown() {
     this.source?.close()
     this.source = null
+    if (this.worker) {
+      const req: WorkerRequest = { type: 'stop' }
+      this.worker.postMessage(req)
+      this.worker.terminate()
+      this.worker = null
+    }
+  }
+
+  disconnect() {
+    this.teardown()
     this.setState('closed')
   }
 
-  private ingest(frame: DeltaFrame) {
+  /** 이진 프레임 적용. 메인 경로의 ingest 와 통계 계산을 공유한다. */
+  private ingestPacked(packed: PackedFrame, startedAt: number) {
+    const result = applyPackedFrame(this.robots, this.indexToId, packed, this.lastSeq)
+
+    if (result.dropped) {
+      this.droppedFrames++
+      return
+    }
+
+    this.lastSeq = packed.seq
+    this.lastFrameAt = Date.now()
+    this.unknownIds += result.unknown
+
+    this.emit(result.changed, {
+      seq: packed.seq,
+      changedCount: result.changed.length,
+      latencyMs: this.lastFrameAt - packed.t,
+      droppedFrames: this.droppedFrames,
+      unknownIds: this.unknownIds,
+      ingestMs: performance.now() - startedAt,
+      payloadBytes: packed.payloadBytes,
+    })
+  }
+
+  private ingest(frame: DeltaFrame, startedAt: number, payloadBytes: number) {
     const result = applyDelta(this.robots, frame, this.lastSeq)
 
     if (result.dropped) {
@@ -119,11 +266,18 @@ export class FleetClient {
       latencyMs: this.lastFrameAt - frame.t,
       droppedFrames: this.droppedFrames,
       unknownIds: this.unknownIds,
+      // 리스너 호출은 제외한다. 그건 렌더 쪽 비용이고 이미 FPS 로 드러난다.
+      ingestMs: performance.now() - startedAt,
+      payloadBytes,
     }
 
+    this.emit(result.changed, stats)
+  }
+
+  private emit(changed: readonly string[], stats: FrameStats) {
     for (const fn of this.frameListeners) {
       try {
-        fn(result.changed, stats)
+        fn(changed, stats)
       } catch (err) {
         console.error('[FleetClient] frame listener 오류', err)
       }

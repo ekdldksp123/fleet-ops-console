@@ -19,6 +19,8 @@ export default function RenderModeToggle() {
   const toggleZones = useFleetUi((s) => s.toggleZones)
   const showTrail = useFleetUi((s) => s.showTrail)
   const toggleTrail = useFleetUi((s) => s.toggleTrail)
+  const parseMode = useFleetUi((s) => s.parseMode)
+  const setParseMode = useFleetUi((s) => s.setParseMode)
 
   return (
     <div className="absolute right-3 top-3 z-10 flex flex-col items-end gap-1.5">
@@ -40,6 +42,29 @@ export default function RenderModeToggle() {
             }`}
           >
             {mode === 'canvas' ? 'Canvas' : 'WebGL'}
+          </button>
+        ))}
+      </div>
+
+      {/* 파싱 위치 A/B. 렌더 경로 토글과 같은 원칙 — 데이터는 그대로 두고 경로만 바꾼다. */}
+      <div
+        className="flex overflow-hidden rounded-md ring-1 ring-slate-700"
+        role="radiogroup"
+        aria-label="델타 파싱 위치"
+      >
+        {(['main', 'worker'] as const).map((mode) => (
+          <button
+            key={mode}
+            role="radio"
+            aria-checked={parseMode === mode}
+            onClick={() => setParseMode(mode)}
+            className={`px-2.5 py-1 text-[11px] font-medium transition-colors ${
+              parseMode === mode
+                ? 'bg-slate-100 text-slate-900'
+                : 'bg-slate-900/85 text-slate-400 hover:bg-slate-800'
+            }`}
+          >
+            {mode === 'main' ? '메인 파싱' : '워커 파싱'}
           </button>
         ))}
       </div>

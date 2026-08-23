@@ -19,6 +19,10 @@ interface Sample {
  * FPS 는 requestAnimationFrame 간격으로 잰다. rAF 는 브라우저가 실제로 화면을
  * 그린 시점에 호출되므로, 메인 스레드가 막히면 그대로 수치에 반영된다.
  * 최저 FPS(minFps)를 같이 보는 이유는 평균만 보면 끊김(스터터)이 숨기 때문이다.
+ *
+ * "삼킴(메인)" 은 프레임 하나를 처리하는 데 메인 스레드가 쓴 시간이다. 프레임 예산
+ * 16.6ms 와 직접 비교하라고 색을 입혔다(3ms 넘으면 주의, 8ms 넘으면 위험).
+ * 이 값이 Web Worker 전환의 판단 근거다 — 작으면 옮길 이유가 없다.
  */
 export default function StatsOverlay() {
   const fleet = useFleet()
@@ -99,6 +103,21 @@ export default function StatsOverlay() {
       <Row label="프레임 seq" value={stats ? String(stats.seq) : '—'} />
       <Row label="갱신 대수" value={stats ? stats.changedCount.toLocaleString() : '—'} />
       <Row label="수신 지연" value={stats ? `${stats.latencyMs}ms` : '—'} />
+      <Row
+        label="삼킴(메인)"
+        value={stats ? `${stats.ingestMs.toFixed(2)}ms` : '—'}
+        className={
+          stats && stats.ingestMs > 8
+            ? 'text-red-400'
+            : stats && stats.ingestMs > 3
+              ? 'text-amber-400'
+              : 'text-slate-200'
+        }
+      />
+      <Row
+        label="페이로드"
+        value={stats ? `${(stats.payloadBytes / 1024).toFixed(0)}KB` : '—'}
+      />
       <Row label="유실 프레임" value={stats ? String(stats.droppedFrames) : '—'} />
     </div>
   )
