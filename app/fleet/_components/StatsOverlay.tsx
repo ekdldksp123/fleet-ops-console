@@ -28,6 +28,7 @@ export default function StatsOverlay() {
   const fleet = useFleet()
   const show = useFleetUi((s) => s.showStats)
   const renderMode = useFleetUi((s) => s.renderMode)
+  const parseMode = useFleetUi((s) => s.parseMode)
 
   const [sample, setSample] = useState<Sample>({ fps: 0, minFps: 0, frameMs: 0 })
   const [stats, setStats] = useState<FrameStats | null>(null)
@@ -96,6 +97,10 @@ export default function StatsOverlay() {
         <span className="text-slate-500">렌더</span>
         <span className="text-slate-200">{renderMode === 'canvas' ? 'Canvas 2D' : 'WebGL'}</span>
       </div>
+      <div className="mb-1 flex items-baseline justify-between">
+        <span className="text-slate-500">파싱</span>
+        <span className="text-slate-200">{parseMode === 'main' ? '메인' : '워커'}</span>
+      </div>
       <Row label="FPS" value={sample.fps.toFixed(1)} className={fpsColor} />
       <Row label="최저 FPS" value={sample.minFps.toFixed(1)} />
       <Row label="최장 프레임" value={`${sample.frameMs.toFixed(1)}ms`} />
@@ -118,6 +123,17 @@ export default function StatsOverlay() {
         label="페이로드"
         value={stats ? `${(stats.payloadBytes / 1024).toFixed(0)}KB` : '—'}
       />
+      {/*
+        버퍼 할당은 워커 모드에서만 의미가 있다. 연결 직후 몇 번 오르고 멈춰야
+        정상이고, 계속 오르면 풀링이 동작하지 않는 것이다.
+      */}
+      {parseMode === 'worker' && (
+        <Row
+          label="버퍼 할당"
+          value={stats ? String(stats.bufferAllocs) : '—'}
+          className={stats && stats.bufferAllocs > 10 ? 'text-amber-400' : 'text-slate-200'}
+        />
+      )}
       <Row label="유실 프레임" value={stats ? String(stats.droppedFrames) : '—'} />
     </div>
   )

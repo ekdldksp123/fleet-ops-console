@@ -39,6 +39,13 @@ export interface FrameStats {
   ingestMs: number
   /** 페이로드 크기(bytes). 파싱 비용의 원인을 크기와 함께 봐야 판단이 된다. */
   payloadBytes: number
+  /**
+   * 워커가 버퍼를 새로 할당한 누적 횟수. 메인 파싱 모드에서는 항상 0.
+   *
+   * 풀링이 동작하는지 확인하는 유일한 지표다. 연결 직후 몇 번 오르고 그 뒤로
+   * 멈춰 있어야 정상이다. 계속 오르면 반납이 안 오거나 용량이 모자라다는 뜻이다.
+   */
+  bufferAllocs: number
 }
 
 type FrameListener = (changed: readonly string[], stats: FrameStats) => void
@@ -78,6 +85,8 @@ export class FleetClient {
 
   parseMode: ParseMode = 'main'
   private url = '/api/fleet/stream'
+  /** 워커가 버퍼를 새로 할당한 누적 횟수. 풀링 동작 확인용. */
+  private bufferAllocs = 0
 
   /**
    * 인덱스 ↔ id 표. 이진 프레임이 id 대신 인덱스를 담기 때문에 필요하다.
@@ -127,6 +136,8 @@ export class FleetClient {
     if (mode === this.parseMode) return
     const wasConnected = Boolean(this.source || this.worker)
     this.parseMode = mode
+    // 전환할 때 리셋한다. 안 하면 이전 모드의 누적치가 남아 풀링 판단을 흐린다.
+    this.bufferAllocs = 0
     if (!wasConnected) return
     this.teardown()
     this.connect()
@@ -226,7 +237,20 @@ export class FleetClient {
 
   /** 이진 프레임 적용. 메인 경로의 ingest 와 통계 계산을 공유한다. */
   private ingestPacked(packed: PackedFrame, startedAt: number) {
+    if (packed.allocated) this.bufferAllocs++
+
     const result = applyPackedFrame(this.robots, this.indexToId, packed, this.lastSeq)
+
+    // ⚠️ 반납은 **다 읽은 직후, 리스너 호출 전**이다. 순서가 중요하다.
+    //
+    //  - 더 일찍 반납하면 applyPackedFrame 이 분리된 버퍼를 읽어 전부 0이 된다.
+    //    로봇이 좌표 (0,0) 으로 순간이동하는데 에러는 안 난다.
+    //  - 리스너 호출 뒤로 미루면 렌더가 끝날 때까지 버퍼가 묶여, 워커가 다음
+    //    프레임에서 풀을 비어 있다고 보고 새로 할당한다. 풀링의 의미가 사라진다.
+    //
+    // 리스너에 넘기는 것은 changed(문자열 배열)와 로봇 Map 이고, 둘 다 이미 복사된
+    // 값이라 버퍼를 붙들고 있지 않다. 그래서 이 시점에 반납해도 안전하다.
+    this.recycle(packed)
 
     if (result.dropped) {
       this.droppedFrames++
@@ -245,7 +269,27 @@ export class FleetClient {
       unknownIds: this.unknownIds,
       ingestMs: performance.now() - startedAt,
       payloadBytes: packed.payloadBytes,
+      bufferAllocs: this.bufferAllocs,
     })
+  }
+
+  /**
+   * 다 쓴 버퍼를 워커로 되돌린다.
+   *
+   * transfer 목록에 네 개를 모두 넣는다 — 빼먹으면 복제가 일어나 반납 자체가
+   * 비용이 된다. 워커가 이미 없으면(모드 전환·언마운트) 그냥 버린다.
+   */
+  private recycle(packed: PackedFrame) {
+    const worker = this.worker
+    if (!worker) return
+
+    const idx = packed.idx.buffer as ArrayBuffer
+    const lonLat = packed.lonLat.buffer as ArrayBuffer
+    const status = packed.status.buffer as ArrayBuffer
+    const battery = packed.battery.buffer as ArrayBuffer
+
+    const req: WorkerRequest = { type: 'recycle', idx, lonLat, status, battery }
+    worker.postMessage(req, [idx, lonLat, status, battery])
   }
 
   private ingest(frame: DeltaFrame, startedAt: number, payloadBytes: number) {
@@ -269,6 +313,7 @@ export class FleetClient {
       // 리스너 호출은 제외한다. 그건 렌더 쪽 비용이고 이미 FPS 로 드러난다.
       ingestMs: performance.now() - startedAt,
       payloadBytes,
+      bufferAllocs: 0,
     }
 
     this.emit(result.changed, stats)

@@ -37,6 +37,13 @@ export interface PackedFrame {
   unknown: number
   /** 원본 JSON 페이로드 크기(bytes). 계측용. */
   payloadBytes: number
+  /**
+   * 이 프레임을 담기 위해 버퍼를 **새로 할당했는지**. 계측용.
+   *
+   * 풀링이 실제로 동작하는지 확인하는 유일한 방법이다. 워밍업 뒤에도 매 프레임
+   * true 면 풀이 비어 있다는 뜻(반납이 안 오거나 용량이 부족하다).
+   */
+  allocated: boolean
   /** length = count */
   idx: Int32Array
   /** length = count * 2, [lon0, lat0, lon1, lat1, ...] */
@@ -64,22 +71,77 @@ export interface DeltaLike {
 }
 
 /**
+ * 한 프레임을 담는 버퍼 한 세트.
+ *
+ * ── 왜 풀링하는가 ──
+ *
+ * transfer 로 넘긴 ArrayBuffer 는 워커에서 **분리(detach)** 되므로 다시 쓸 수 없다.
+ * 그래서 순진하게 구현하면 프레임마다 네 개를 새로 할당한다. 60,000대 기준 약 1.5MB
+ * × 10Hz = 초당 15MB 의 할당이고, 그 GC 압력이 "파싱을 옮겨 아낀 시간" 을 잡아먹는다.
+ * 실측에서 렌더가 이미 포화된 구간에서는 FPS 가 오히려 떨어졌다.
+ *
+ * 해결은 메인 스레드가 다 쓴 버퍼를 워커로 **되돌려 주는** 것이다. 그러면 정상
+ * 상태에서 할당이 0이 된다.
+ *
+ * ── 용량을 플릿 크기로 고정한다 ──
+ *
+ * 프레임당 갱신 건수는 변하지만 플릿 크기를 넘을 수 없다. 그래서 크기별 풀을 관리하는
+ * 대신 최대 용량으로 잡고 매번 앞부분만 쓴다. 재사용할 때 남은 뒷부분에 옛 데이터가
+ * 있지만 `count` 만큼만 읽으므로 새지 않는다(tests 가 확인).
+ */
+export interface FrameBuffers {
+  idx: Int32Array
+  lonLat: Float64Array
+  status: Uint8Array
+  battery: Float32Array
+}
+
+export function createFrameBuffers(capacity: number): FrameBuffers {
+  return {
+    idx: new Int32Array(capacity),
+    lonLat: new Float64Array(capacity * 2),
+    status: new Uint8Array(capacity),
+    battery: new Float32Array(capacity),
+  }
+}
+
+/** 세트가 담을 수 있는 최대 갱신 건수. 분리된 버퍼는 length 가 0이 된다. */
+export function bufferCapacity(buffers: FrameBuffers): number {
+  return buffers.idx.length
+}
+
+/** 반납된 ArrayBuffer 들로 세트를 복원한다. 워커가 recycle 메시지에서 쓴다. */
+export function frameBuffersFrom(raw: {
+  idx: ArrayBuffer
+  lonLat: ArrayBuffer
+  status: ArrayBuffer
+  battery: ArrayBuffer
+}): FrameBuffers {
+  return {
+    idx: new Int32Array(raw.idx),
+    lonLat: new Float64Array(raw.lonLat),
+    status: new Uint8Array(raw.status),
+    battery: new Float32Array(raw.battery),
+  }
+}
+
+/**
  * 파싱된 델타 → 이진 프레임. **워커에서** 실행된다.
+ *
+ * `buffers` 를 주면 재사용하고, 없거나 용량이 모자라면 새로 할당한다(allocated=true).
  *
  * 인덱스 표에 없는 id 는 담지 않고 개수만 센다. 인덱스를 못 정하면 메인 스레드가
  * 어느 로봇인지 알 수 없으므로 담을 방법이 없다 — 대신 개수를 넘겨 드러낸다.
  */
-export function packFrame(
+export function packFrameInto(
   frame: DeltaLike,
   idToIndex: Map<string, number>,
   payloadBytes: number,
+  buffers?: FrameBuffers,
 ): PackedFrame {
   const n = frame.updates.length
-  // 미지의 id 를 걸러낸 뒤 길이가 줄 수 있으므로 최대 크기로 잡고 마지막에 자른다.
-  const idx = new Int32Array(n)
-  const lonLat = new Float64Array(n * 2)
-  const status = new Uint8Array(n)
-  const battery = new Float32Array(n)
+  const allocated = !buffers || bufferCapacity(buffers) < n
+  const buf = allocated ? createFrameBuffers(Math.max(n, 1)) : buffers!
 
   let k = 0
   let unknown = 0
@@ -89,27 +151,38 @@ export function packFrame(
       unknown++
       continue
     }
-    idx[k] = i
-    lonLat[k * 2] = lon
-    lonLat[k * 2 + 1] = lat
-    status[k] = statusCode
-    battery[k] = batteryPct
+    buf.idx[k] = i
+    buf.lonLat[k * 2] = lon
+    buf.lonLat[k * 2 + 1] = lat
+    buf.status[k] = statusCode
+    buf.battery[k] = batteryPct
     k++
   }
 
-  // subarray 는 같은 버퍼를 공유하는 뷰다. 그래서 transfer 로 넘겨도 정상이고,
-  // slice 처럼 복사가 일어나지 않는다.
+  // subarray 는 같은 버퍼를 공유하는 뷰다. 그래서 transfer 로 넘겨도 버퍼 전체가
+  // 이동하고, slice 처럼 복사가 일어나지 않는다. 재사용 시 뒷부분의 옛 데이터는
+  // count 밖이라 읽히지 않는다.
   return {
     seq: frame.seq,
     t: frame.t,
     count: k,
     unknown,
     payloadBytes,
-    idx: idx.subarray(0, k),
-    lonLat: lonLat.subarray(0, k * 2),
-    status: status.subarray(0, k),
-    battery: battery.subarray(0, k),
+    allocated,
+    idx: buf.idx.subarray(0, k),
+    lonLat: buf.lonLat.subarray(0, k * 2),
+    status: buf.status.subarray(0, k),
+    battery: buf.battery.subarray(0, k),
   }
+}
+
+/** 풀 없이 매번 할당하는 변형. 테스트와 단발 호출용. */
+export function packFrame(
+  frame: DeltaLike,
+  idToIndex: Map<string, number>,
+  payloadBytes: number,
+): PackedFrame {
+  return packFrameInto(frame, idToIndex, payloadBytes)
 }
 
 export interface PackedApplyResult {

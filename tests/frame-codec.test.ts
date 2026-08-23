@@ -1,7 +1,15 @@
 import { describe, expect, it } from 'vitest'
 
 import { applyDelta } from '@/lib/delta'
-import { applyPackedFrame, packFrame, type DeltaLike } from '@/lib/frame-codec'
+import {
+  applyPackedFrame,
+  bufferCapacity,
+  createFrameBuffers,
+  frameBuffersFrom,
+  packFrame,
+  packFrameInto,
+  type DeltaLike,
+} from '@/lib/frame-codec'
 import type { DeltaFrame, Robot } from '@/lib/types'
 
 function robot(overrides: Partial<Robot> = {}): Robot {
@@ -156,5 +164,147 @@ describe('이진 프레임 코덱', () => {
     const packed = packFrame({ t: 1, seq: 1, updates: [] }, idToIndex, 0)
     expect(packed.count).toBe(0)
     expect(applyPackedFrame(fleet(ids), indexToId, packed, 0).changed).toEqual([])
+  })
+})
+
+/**
+ * 버퍼 풀링.
+ *
+ * 재사용의 유일한 위험은 **옛 데이터 누출**이다. 세트를 다시 쓰면 지난 프레임의 값이
+ * 뒷부분에 남아 있는데, count 를 잘못 계산하거나 뷰를 잘못 자르면 그 값이 로봇 좌표로
+ * 들어간다. 로봇이 지난 프레임의 다른 로봇 자리로 순간이동하는 식으로 나타나서,
+ * 에러 없이 화면만 이상해진다.
+ */
+describe('버퍼 풀링', () => {
+  const ids = ['RB-00000', 'RB-00001', 'RB-00002', 'RB-00003']
+  const indexes = () => ({
+    idToIndex: new Map(ids.map((id, i) => [id, i])),
+    indexToId: ids,
+  })
+  const fleet = () => new Map(ids.map((id) => [id, robot({ id })]))
+
+  it('용량이 충분하면 새로 할당하지 않는다', () => {
+    const { idToIndex } = indexes()
+    const buffers = createFrameBuffers(4)
+
+    const packed = packFrameInto(
+      { t: 1, seq: 1, updates: [['RB-00000', 1, 2, 1, 50]] },
+      idToIndex,
+      10,
+      buffers,
+    )
+
+    expect(packed.allocated).toBe(false)
+    // 같은 버퍼를 가리켜야 한다
+    expect(packed.idx.buffer).toBe(buffers.idx.buffer)
+  })
+
+  it('용량이 모자라면 새로 할당한다', () => {
+    const { idToIndex } = indexes()
+    const tiny = createFrameBuffers(1)
+
+    const packed = packFrameInto(
+      {
+        t: 1,
+        seq: 1,
+        updates: [
+          ['RB-00000', 1, 2, 1, 50],
+          ['RB-00001', 3, 4, 1, 50],
+        ],
+      },
+      idToIndex,
+      10,
+      tiny,
+    )
+
+    expect(packed.allocated).toBe(true)
+    expect(packed.count).toBe(2)
+  })
+
+  it('버퍼를 재사용해도 지난 프레임 데이터가 새지 않는다', () => {
+    // 큰 프레임 → 작은 프레임 순서로 같은 버퍼를 쓴다. 작은 프레임 결과에 큰 프레임의
+    // 값이 섞이면 안 된다.
+    const { idToIndex, indexToId } = indexes()
+    const buffers = createFrameBuffers(4)
+
+    // 1) 로봇 4대를 멀리 보낸다
+    const big = packFrameInto(
+      {
+        t: 1,
+        seq: 1,
+        updates: [
+          ['RB-00000', 10, 20, 1, 11],
+          ['RB-00001', 30, 40, 2, 22],
+          ['RB-00002', 50, 60, 3, 33],
+          ['RB-00003', 70, 80, 0, 44],
+        ],
+      },
+      idToIndex,
+      10,
+      buffers,
+    )
+    expect(big.count).toBe(4)
+
+    // 2) 같은 버퍼로 1대만 담는다
+    const small = packFrameInto(
+      { t: 2, seq: 2, updates: [['RB-00002', 1.5, 2.5, 1, 55]] },
+      idToIndex,
+      10,
+      buffers,
+    )
+
+    expect(small.allocated).toBe(false)
+    expect(small.count).toBe(1)
+    // 뷰가 정확히 1건만 노출해야 한다
+    expect(small.idx.length).toBe(1)
+    expect(small.lonLat.length).toBe(2)
+
+    const robots = fleet()
+    const result = applyPackedFrame(robots, indexToId, small, 0)
+
+    // RB-00002 만 바뀌고, 큰 프레임의 좌표(10,20 / 30,40 / 70,80)는 어디에도 없다
+    expect(result.changed).toEqual(['RB-00002'])
+    expect(robots.get('RB-00002')).toMatchObject({ lon: 1.5, lat: 2.5, battery: 55 })
+    for (const id of ['RB-00000', 'RB-00001', 'RB-00003']) {
+      expect(robots.get(id)).toMatchObject({ lon: 126.9, lat: 37.24 })
+    }
+  })
+
+  it('반납된 ArrayBuffer 로 세트를 복원할 수 있다', () => {
+    // 워커가 recycle 메시지에서 하는 일. 용량이 보존되어야 재사용에 의미가 있다.
+    const buffers = createFrameBuffers(7)
+    const restored = frameBuffersFrom({
+      idx: buffers.idx.buffer as ArrayBuffer,
+      lonLat: buffers.lonLat.buffer as ArrayBuffer,
+      status: buffers.status.buffer as ArrayBuffer,
+      battery: buffers.battery.buffer as ArrayBuffer,
+    })
+
+    expect(bufferCapacity(restored)).toBe(7)
+    expect(restored.lonLat.length).toBe(14)
+  })
+
+  it('풀링 경로와 비풀링 경로의 결과가 같다', () => {
+    const { idToIndex, indexToId } = indexes()
+    const updates: DeltaLike['updates'] = [
+      ['RB-00000', 126.884394, 37.251015, 3, 43.5],
+      ['RB-00002', 126.9012, 37.241, 2, 99.9],
+    ]
+
+    const a = fleet()
+    applyPackedFrame(a, indexToId, packFrame({ t: 1, seq: 1, updates }, idToIndex, 1), 0)
+
+    const b = fleet()
+    const buffers = createFrameBuffers(4)
+    // 한 번 써서 더럽힌 뒤 재사용한다
+    packFrameInto({ t: 0, seq: 0, updates: [['RB-00003', 9, 9, 0, 9]] }, idToIndex, 1, buffers)
+    applyPackedFrame(
+      b,
+      indexToId,
+      packFrameInto({ t: 1, seq: 1, updates }, idToIndex, 1, buffers),
+      0,
+    )
+
+    for (const id of ids) expect(b.get(id)).toEqual(a.get(id))
   })
 })
