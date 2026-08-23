@@ -11,16 +11,21 @@ export type ConnectionState = 'idle' | 'connecting' | 'open' | 'reconnecting' | 
 /**
  * 델타를 어떤 경로로 받는가. 세 방식이 **같은 데이터**를 다르게 실어 온다.
  *
- *   'main'   : 메인 스레드에서 SSE + JSON.parse                    (기본값 = before)
+ *   'main'   : 메인 스레드에서 SSE + JSON.parse                    (벤치마크의 before)
  *   'worker' : 워커가 SSE + JSON.parse, 이진 프레임만 메인으로 전송
- *   'binary' : 서버가 이진으로 보내고 워커는 바이트 복사만 — **파싱 없음**
+ *   'binary' : 서버가 이진으로 보내고 워커는 바이트 복사만 — **파싱 없음** (기본값)
  *
  * 앞의 둘은 "JSON 을 어디서 파싱할까" 를 다루고, 마지막은 "JSON 을 아예 안 쓴다" 다.
  * 세 방식을 나란히 둔 이유는 A/B 측정이다 — 데이터가 같아야 인코딩·스레드 차이만
  * 비교할 수 있다.
  *
- * 기본을 'main' 으로 두는 건 의도적이다 — 벤치마크의 "before" 가 기본 상태여야
- * 개선 폭이 정직하게 드러난다(렌더 모드 토글과 같은 원칙).
+ * 기본은 'binary' 다. 세 경로를 실측해 보니 이진이 모든 구간에서 메인보다 나쁘지 않고
+ * 대역폭이 37% 적었다. Worker 를 못 쓰는 환경이나 빅 엔디언 플랫폼에서는 connect() 가
+ * 자동으로 메인 경로로 물러난다.
+ *
+ * 렌더 모드(canvas 기본)와 방침이 다른 이유: 렌더는 GPU 유무에 따라 결과가 뒤집혀서
+ * 기본값을 정할 수 없지만, 수신 경로는 측정이 끝났다. 측정이 끝난 축을 일부러 나쁜
+ * 쪽에 고정해 둘 이유가 없다.
  */
 export type FeedMode = 'main' | 'worker' | 'binary'
 
@@ -92,7 +97,7 @@ export class FleetClient {
   private frameListeners = new Set<FrameListener>()
   private stateListeners = new Set<StateListener>()
 
-  feedMode: FeedMode = 'main'
+  feedMode: FeedMode = 'binary'
   private url = '/api/fleet/stream'
   /** 이진 스트림 라우트. SSE 라우트와 같은 데이터를 다른 인코딩으로 낸다. */
   private binaryUrl = '/api/fleet/binary'

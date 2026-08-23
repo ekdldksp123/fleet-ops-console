@@ -116,11 +116,14 @@ test('구역 오버레이를 토글할 수 있다', async ({ page }) => {
  *       추가로 발생하지 않는다. FleetShell 이 layout.tsx 에서 page.tsx 로
  *       내려가면 둘 다 깨진다.
  */
-test('상세 라우트로 전환해도 지도 인스턴스와 SSE 가 유지된다', async ({ page }) => {
-  // SSE 요청 수를 센다. 재마운트되면 EventSource 가 새로 열린다.
-  let sseRequests = 0
+test('상세 라우트로 전환해도 지도 인스턴스와 스트림 연결이 유지된다', async ({ page }) => {
+  // 스트림 요청 수를 센다. 재마운트되면 연결이 새로 열린다.
+  // 기본 수신 경로가 이진이므로 두 라우트를 모두 센다 — 한쪽만 세면 기본값이 바뀔 때
+  // 테스트가 0을 세고도 통과하거나 엉뚱하게 실패한다.
+  let streamRequests = 0
   page.on('request', (req) => {
-    if (req.url().includes('/api/fleet/stream')) sseRequests++
+    const u = req.url()
+    if (u.includes('/api/fleet/stream') || u.includes('/api/fleet/binary')) streamRequests++
   })
 
   await page.goto('/fleet')
@@ -129,22 +132,22 @@ test('상세 라우트로 전환해도 지도 인스턴스와 SSE 가 유지된�
   const mapEl = page.getByRole('application', { name: '플릿 관제 지도' })
   const before = await mapEl.getAttribute('data-map-instance')
   expect(before).toBe('1')
-  expect(sseRequests).toBe(1)
+  expect(streamRequests).toBe(1)
 
   // 목록에서 로봇을 선택 → /fleet/[id] 로 이동
   await tableRows(page).first().click()
   await expect(page).toHaveURL(/\/fleet\/RB-\d+$/)
   await expect(page.getByRole('complementary', { name: '로봇 상세' })).toBeVisible()
 
-  // 지도는 같은 인스턴스, SSE 도 같은 연결이어야 한다
+  // 지도는 같은 인스턴스, 스트림도 같은 연결이어야 한다
   expect(await mapEl.getAttribute('data-map-instance')).toBe(before)
-  expect(sseRequests).toBe(1)
+  expect(streamRequests).toBe(1)
 
   // 닫기 → /fleet 로 복귀. 여기서도 유지되어야 한다
   await page.getByRole('link', { name: /닫기/ }).click()
   await expect(page).toHaveURL(/\/fleet$/)
   expect(await mapEl.getAttribute('data-map-instance')).toBe(before)
-  expect(sseRequests).toBe(1)
+  expect(streamRequests).toBe(1)
 })
 
 test('상세 링크를 직접 열면 해당 로봇이 선택된 상태로 뜬다', async ({ page }) => {
@@ -331,10 +334,14 @@ for (const mode of ['이진', '메인 파싱'] as const) {
     await page.goto('/fleet?frames=15')
     await waitForLive(page)
 
-    if (mode !== '메인 파싱') {
-      await page.getByRole('radio', { name: mode }).click()
+    // 기본값에 의존하지 않고 대상 경로를 항상 명시적으로 고른다. 기본값이 바뀌면
+    // "메인 파싱 경로" 테스트가 조용히 다른 경로를 재게 된다.
+    const radio = page.getByRole('radio', { name: mode })
+    if ((await radio.getAttribute('aria-checked')) !== 'true') {
+      await radio.click()
       await waitForLive(page)
     }
+    await expect(radio).toHaveAttribute('aria-checked', 'true')
 
     const first = await seq()
     expect(first).toBeGreaterThan(0)

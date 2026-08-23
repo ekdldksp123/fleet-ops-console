@@ -48,8 +48,17 @@ export const useFleetUi = create<FleetUiState>((set) => ({
   showStats: true,
   showZones: true,
   showTrail: true,
-  // 기본을 'main' 으로 두는 것도 의도적이다. 벤치마크의 before 가 기본 상태여야 한다.
-  feedMode: 'main',
+  // 기본을 'binary' 로 둔다.
+  //
+  // 렌더 모드(canvas)와 달리 여기서는 벤치마크의 before 를 기본값으로 두지 않는다.
+  // 세 경로를 실측해 보니 이진이 모든 구간에서 메인보다 나쁘지 않고 대역폭이 37%
+  // 적었다(README "6. 서버가 이진 프레임을 보낸다"). 측정이 끝난 축을 일부러 나쁜
+  // 쪽에 고정해 둘 이유가 없다.
+  //
+  // before 비교는 우상단 토글로 언제든 할 수 있다 — 데이터가 동일하므로 공정하다.
+  // Worker 를 못 쓰는 환경이나 빅 엔디언 플랫폼에서는 FleetClient 가 자동으로
+  // 메인 경로로 물러난다.
+  feedMode: 'binary',
 
   select: (id) => set({ selectedId: id }),
   setStatusFilter: (statusFilter) => set({ statusFilter }),
