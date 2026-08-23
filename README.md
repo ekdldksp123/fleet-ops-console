@@ -110,12 +110,14 @@ lib/
   frame-codec.ts  Worker ↔ 메인 이진 프레임 코덱 (순수 함수)
   fleet.worker.ts 델타 수신 워커 (SSE+JSON / 이진 두 경로)
   wire-format.ts  서버 전송용 이진 포맷 (순수 함수)
-  binary-feed.ts  이진 스트림 재조립 + 재연결
+  binary-feed.ts  이진 스트림 재연결 루프 (fetch + 백오프)
+  frame-reassembler.ts 청크 → 프레임 재조립 (네트워크 없이 테스트 가능)
   fleet-client.ts 클라이언트 실시간 보관소 ★ 핵심 설계
   simulator.ts    서버 사이드 플릿 시뮬레이터 (결정적 PRNG)
 
 store/fleet-store.ts   Zustand — UI 상태 전용
-tests/                 Vitest — geo, delta, zones, frame-codec, wire-format, ol-invariants
+tests/                 Vitest — geo, delta, zones, frame-codec, wire-format,
+                       frame-reassembler, binary-feed, ol-invariants
 e2e/                   Playwright
 ```
 
@@ -680,7 +682,39 @@ JSON을 쓰지 않는 것이다.
 또 이진 경로의 재연결은 손으로 구현한 것이라 EventSource만큼 검증되지 않았다.
 
 **실서비스라면 `binary`를 기본으로 두는 게 맞다** — 세 구간 모두에서 나쁘지 않고
-대역폭이 37% 적다. 다만 그 전에 재연결 경로를 네트워크 장애 주입으로 시험해봐야 한다.
+대역폭이 37% 적다.
+
+#### 재연결 검증 — 하네스가 먼저 문제였다
+
+손으로 만든 재연결은 "끊기면 그냥 멈추는" 방식으로 조용히 실패한다. 에러도 없고
+화면은 마지막 프레임 그대로 얼어붙는다. 그래서 실제로 끊어 보고 확인했다.
+
+**`context.setOffline(true)` 로는 검증할 수 없다.** 오프라인 15초 동안 seq 가 계속
+올랐다 — CDP 의 오프라인 에뮬레이션은 **이미 성립된 연결에 영향을 주지 않는다.**
+라우트 가로채기(`page.route`)로도 흐르고 있는 스트림은 끊을 수 없다. 처음 쓴 테스트가
+실패한 게 제품 버그로 보였지만, 원인은 하네스였다.
+
+그래서 세 층으로 나눠 검증했다.
+
+| 층 | 무엇을 끊는가 | 어디서 |
+| --- | --- | --- |
+| 재조립 | 청크 절단·desync·반쪽 프레임 | `tests/frame-reassembler.test.ts` (11개) |
+| 재연결 루프 | `fetch` 거부·503·스트림 종료·`stop` | `tests/binary-feed.test.ts` (6개) |
+| 전 구간 | 서버가 스트림을 닫음 (`?frames=N`) | `e2e/fleet.spec.ts` (3개) |
+
+전 구간 테스트를 위해 두 스트림 라우트에 `?frames=N` 을 넣었다 — N 프레임 뒤 스트림을
+닫는다. 테스트 전용 코드를 제품에 넣는 건 꺼릴 만한 일이지만, 이게 없으면 재연결이
+**아예 검증 불가능**하다. 파라미터가 없으면 프로덕션 동작은 그대로다(대조군 테스트로
+확인).
+
+재조립 테스트에서 가장 위험한 실패 방식을 찾았다. **재연결 시 버퍼를 비우지 않으면
+손상된 프레임이 조용히 방출된다.** 끊긴 연결의 반쪽 프레임 뒤에 새 스트림 바이트가
+붙으면 옛 헤더의 `byteLength` 가 채워질 만큼 길이가 차서 **프레임이 완성된 것처럼
+보인다.** magic 은 옛 헤더의 것이라 정상이고 desync 도 안 난다. 그래서 `readOnce` 는
+연결 성립 직후 반드시 `reset()` 한다.
+
+세 층 모두 통과한다. 이제 `binary` 를 기본으로 올릴 근거가 생겼지만, 기본값은
+벤치마크 원칙에 따라 `main` 으로 남겼다.
 
 ---
 
@@ -746,9 +780,14 @@ JSON을 쓰지 않는 것이다.
 - `tests/wire-format.test.ts` — 이진 포맷 왕복. 오프셋 하나만 어긋나도 좌표가 **쓰레기
   값**이 되어 로봇이 지구 반대편으로 날아가거나 NaN 이 되어 사라진다 — 에러는 안 난다.
   정렬 요구, 정렬되지 않은 오프셋에서의 읽기, keep-alive 구분까지 덮는다.
+- `tests/frame-reassembler.test.ts` — 청크가 잘리는 모든 경우(바이트 단위 절단, 헤더
+  걸침, 한 청크 다중 프레임, desync). 여기가 틀리면 좌표가 쓰레기가 되는데 에러는 안 난다.
+- `tests/binary-feed.test.ts` — 재연결 루프. `fetch` 를 스텁해 연결 거부·503·스트림
+  종료를 결정적으로 재현한다. 실제 서버를 죽이고 살리는 스크립트로도 시도했지만
+  프로세스 조율이 불안정했다.
 - `e2e/fleet.spec.ts` — 서버 렌더 확인, SSE seq 증가, 선택 연동, 필터, 렌더모드 전환,
   구역 집계·오버레이 토글, 상세 라우트(지도 인스턴스·SSE 유지, 직접 링크, not-found,
-  뒤로가기), 경보 레일(하드 내비게이션 포함), 경로 토글, 제어 명령(정지 유지 확인), 수신 경로 3종 전환 (16개)
+  뒤로가기), 경보 레일(하드 내비게이션 포함), 경로 토글, 제어 명령(정지 유지 확인), 수신 경로 3종 전환, 단절 후 재연결 (19개)
 
 > `yarn test:e2e` 는 Playwright 번들 브라우저가 필요하다. 처음 실행 전에
 > `yarn playwright install chromium` 을 한 번 돌릴 것.

@@ -21,7 +21,8 @@ const tableRows = (page: Page) =>
  * 추가했을 때 실제로 이 테스트가 깨졌다.
  */
 async function waitForLive(page: Page) {
-  await expect(page.getByText('SSE 수신 중')).toBeVisible({ timeout: 20_000 })
+  // 라벨의 접두는 수신 경로에 따라 "SSE" 또는 "이진" 이다. 상태만 본다.
+  await expect(page.getByText(/(SSE|이진) 수신 중/)).toBeVisible({ timeout: 20_000 })
 }
 
 test('초기 스냅샷이 서버에서 렌더된다', async ({ page }) => {
@@ -299,4 +300,68 @@ test('워커 파싱·이진으로 전환해도 스트림이 계속 흐른다', a
   }
 
   expect(errors, `페이지 에러: ${errors.join(' | ')}`).toHaveLength(0)
+})
+
+/**
+ * 재연결 — 서버가 스트림을 끊는 장애 주입.
+ *
+ * 이진 경로는 EventSource 의 자동 재연결을 잃고 직접 구현했다(lib/binary-feed.ts).
+ * 손으로 만든 재연결은 "끊기면 그냥 멈추는" 방식으로 조용히 실패한다 — 에러도 없고
+ * 화면은 마지막 프레임 그대로 얼어붙는다. 그래서 실제로 끊어 보고 붙는지 확인한다.
+ *
+ * ⚠️ `context.setOffline(true)` 로는 검증할 수 없다. **이미 성립된 연결에 영향을
+ * 주지 않는다**(실측 확인: 오프라인 15초 동안 seq 가 계속 올랐다). 라우트 가로채기로도
+ * 흐르고 있는 스트림은 끊을 수 없다. 그래서 서버가 끊어 준다 — `?frames=N`
+ * (app/api/fleet/binary/route.ts 주석 참고).
+ */
+for (const mode of ['이진', '메인 파싱'] as const) {
+  test(`${mode} 경로가 스트림 단절 후 재연결된다`, async ({ page }) => {
+    const seq = async () => {
+      const t = await page
+        .locator('text=프레임 seq')
+        .locator('..')
+        .locator('span')
+        .last()
+        .textContent()
+      return Number(t)
+    }
+
+    // 스트림이 15프레임(약 1.5초) 뒤 끊긴다. 재연결도 같은 제한을 받으므로
+    // 끊김 → 재연결이 반복된다 — seq 가 계속 오르면 재연결이 살아 있다는 뜻이다.
+    await page.goto('/fleet?frames=15')
+    await waitForLive(page)
+
+    if (mode !== '메인 파싱') {
+      await page.getByRole('radio', { name: mode }).click()
+      await waitForLive(page)
+    }
+
+    const first = await seq()
+    expect(first).toBeGreaterThan(0)
+
+    // 첫 스트림이 끊긴 뒤(15프레임)에도 seq 가 계속 올라야 한다. 재연결이 안 되면
+    // 여기서 멈춘다.
+    await expect
+      .poll(seq, { timeout: 30_000, intervals: [1000] })
+      .toBeGreaterThan(first + 15)
+
+    // 여러 번의 끊김·재연결을 지나도 지도 갱신이 살아 있어야 한다
+    const changed = await page
+      .locator('text=갱신 대수')
+      .locator('..')
+      .locator('span')
+      .last()
+      .textContent()
+    expect(Number((changed ?? '0').replace(/,/g, '')), '재연결 후 지도 갱신이 없다').toBeGreaterThan(0)
+  })
+}
+
+test('장애 주입이 없으면 스트림이 끊기지 않는다', async ({ page }) => {
+  // 위 테스트가 의미를 갖기 위한 대조군. frames 파라미터가 프로덕션 동작을 바꾸지
+  // 않는다는 확인이기도 하다.
+  await page.goto('/fleet')
+  await waitForLive(page)
+  await page.waitForTimeout(3000)
+  // 끊김 표시가 한 번도 안 나와야 한다
+  await expect(page.getByText(/(SSE|이진) (재연결 중|끊김)/)).toHaveCount(0)
 })

@@ -21,7 +21,29 @@ export const runtime = 'nodejs'
 /** 프록시가 유휴 연결을 끊지 않도록 보내는 주석 하트비트 주기 */
 const HEARTBEAT_MS = 15_000
 
+
+/**
+ * 장애 주입용 파라미터 `?frames=N`.
+ *
+ * N 프레임을 보낸 뒤 스트림을 닫는다. 재연결 경로를 테스트하려면 연결을 실제로
+ * 끊어야 하는데, 그게 브라우저 쪽에서는 불가능하다 — Playwright 의 setOffline 은
+ * **이미 성립된 연결에 영향을 주지 않고**(실측 확인), 라우트 가로채기로는 흐르고
+ * 있는 스트림을 끊을 수 없다.
+ *
+ * 그래서 서버가 끊어 준다. 프로덕션 동작에는 영향이 없다(파라미터가 없으면 무한).
+ * 테스트 전용 코드를 제품에 넣는 건 꺼릴 만한 일이지만, 이 파라미터가 없으면
+ * 재연결이 **아예 검증 불가능**해진다 — 손으로 만든 재연결이 조용히 멈추는 걸
+ * 못 잡는 것보다는 낫다는 판단이다. 수동 확인에도 쓸 수 있다.
+ */
+function frameLimit(request: Request): number {
+  const raw = new URL(request.url).searchParams.get('frames')
+  const n = raw === null ? 0 : Number(raw)
+  return Number.isFinite(n) && n > 0 ? n : 0
+}
+
 export async function GET(request: Request) {
+  const limit = frameLimit(request)
+  let sent = 0
   const simulator = getSimulator()
   const encoder = new TextEncoder()
 
@@ -58,6 +80,9 @@ export async function GET(request: Request) {
 
       const onFrame = (frame: DeltaFrame) => {
         write(`id: ${frame.seq}\ndata: ${JSON.stringify(frame)}\n\n`)
+        // 장애 주입: N 프레임 뒤 스트림을 닫는다. EventSource 는 스스로 재연결하므로
+        // 이진 경로(손으로 만든 재연결)와 대조할 수 있다.
+        if (limit > 0 && ++sent >= limit) cleanup()
       }
 
       unsubscribe = simulator.subscribe(onFrame)

@@ -96,6 +96,12 @@ export class FleetClient {
   private url = '/api/fleet/stream'
   /** 이진 스트림 라우트. SSE 라우트와 같은 데이터를 다른 인코딩으로 낸다. */
   private binaryUrl = '/api/fleet/binary'
+
+  /**
+   * 두 라우트에 함께 붙일 쿼리스트링. 장애 주입 테스트가 `frames=N` 을 심는 데 쓴다
+   * (app/api/fleet/binary/route.ts 주석 참고). 프로덕션에서는 빈 문자열이다.
+   */
+  streamQuery = ''
   /** 워커가 버퍼를 새로 할당한 누적 횟수. 풀링 동작 확인용. */
   private bufferAllocs = 0
 
@@ -163,7 +169,7 @@ export class FleetClient {
   private connectOnMainThread() {
     this.setState('connecting')
 
-    const es = new EventSource(this.url)
+    const es = new EventSource(this.url + this.streamQuery)
     this.source = es
 
     es.addEventListener('meta', (event) => {
@@ -235,7 +241,7 @@ export class FleetClient {
     const encoding = this.feedMode === 'binary' ? 'binary' : 'json'
     const req: WorkerRequest = {
       type: 'start',
-      url: encoding === 'binary' ? this.binaryUrl : this.url,
+      url: (encoding === 'binary' ? this.binaryUrl : this.url) + this.streamQuery,
       ids: this.indexToId,
       encoding,
     }

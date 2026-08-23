@@ -6,6 +6,8 @@ import { summarize, type FleetSummary } from '@/lib/delta'
 import { STATUS_COLORS, STATUS_LABELS, type StatusCode } from '@/lib/types'
 import type { ConnectionState } from '@/lib/fleet-client'
 
+import { useFleetUi } from '@/store/fleet-store'
+
 import { useFleet } from './FleetProvider'
 
 const REFRESH_MS = 400
@@ -34,6 +36,9 @@ export default function LiveStatusBar() {
   const fleet = useFleet()
   const [summary, setSummary] = useState<FleetSummary>(() => summarize(fleet.robots.values()))
   const [state, setState] = useState<ConnectionState>(fleet.state)
+  // 수신 경로에 따라 라벨이 달라야 한다. 이진 모드에서 "SSE" 라고 쓰면 거짓이다 —
+  // 그 경로는 EventSource 를 쓰지 않고 fetch 스트림으로 받는다.
+  const feedMode = useFleetUi((s) => s.feedMode)
 
   useEffect(() => fleet.onState(setState), [fleet])
 
@@ -57,7 +62,7 @@ export default function LiveStatusBar() {
       <div className="flex items-center gap-1.5">
         <span className={`size-1.5 rounded-full ${STATE_COLOR[state]}`} aria-hidden />
         <span className="text-[10px] font-medium text-slate-400">
-          SSE {STATE_LABEL[state]}
+          {feedMode === 'binary' ? '이진' : 'SSE'} {STATE_LABEL[state]}
         </span>
         <span className="ml-auto text-[10px] text-slate-500">
           저전력 <span className="tabular-nums text-amber-400">{summary.lowBattery}</span>대 · 평균{' '}

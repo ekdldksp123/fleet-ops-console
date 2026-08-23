@@ -25,6 +25,12 @@ export function FleetProvider({
   const feedMode = useFleetUi((s) => s.feedMode)
 
   useEffect(() => {
+    // 장애 주입 훅. e2e 가 `?frames=N` 을 심어 스트림을 N 프레임 뒤 끊게 만든다.
+    // 재연결은 손으로 구현한 경로라(lib/binary-feed.ts) 실제로 끊어 보지 않으면
+    // 조용히 멈추는 걸 못 잡는다. URL 검색 파라미터로만 켜지므로 평소엔 빈 문자열이다.
+    const injected = new URLSearchParams(window.location.search).get('frames')
+    client.streamQuery = injected ? `?frames=${Number(injected) || ''}` : ''
+
     // 첫 연결 전에 모드를 정해 둔다. connect 안에서 분기하므로 순서가 중요하다.
     client.feedMode = feedMode
     client.connect()

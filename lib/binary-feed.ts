@@ -9,12 +9,14 @@
  *  1. **프레임 경계.** SSE 는 `\n\n` 으로 메시지를 끊어 준다. 이진 스트림의 청크는
  *     프레임과 무관하게 잘려 온다 — 한 청크에 프레임이 3개 반 들어 있을 수 있다.
  *     그래서 길이 접두(헤더의 byteLength)를 보고 직접 이어붙인다.
+ *     그 재조립은 FrameReassembler 로 분리했다(네트워크 없이 테스트 가능하도록).
  *  2. **자동 재연결.** 끊기면 직접 다시 붙어야 한다. 지수 백오프로 구현한다.
  *
  * 이게 이진 전송의 실질적인 비용이다. 성능을 얻고 프레임워크가 해주던 일을 떠안는다.
  */
 
-import { HEADER_BYTES, MAGIC, readHeader, type FrameHeader } from './wire-format'
+import { FrameReassembler } from './frame-reassembler'
+import type { FrameHeader } from './wire-format'
 
 export interface BinaryFeedHandlers {
   onFrame: (bytes: Uint8Array, offset: number, header: FrameHeader) => void
@@ -29,20 +31,22 @@ export class BinaryFeed {
   private stopped = false
   private attempt = 0
 
-  /**
-   * 재조립 버퍼.
-   *
-   * 남은 바이트를 앞으로 당기는 방식(compaction)을 쓴다. 링 버퍼가 더 우아하지만
-   * 프레임을 읽을 때 두 조각으로 갈라질 수 있어서, 정렬 복사를 한 번 더 해야 한다.
-   * 프레임 하나가 최대 1.5MB 라 compaction 의 memmove 가 더 싸다.
-   */
-  private buf = new Uint8Array(0)
-  private len = 0
+  private readonly reassembler: FrameReassembler
 
   constructor(
     private readonly url: string,
     private readonly handlers: BinaryFeedHandlers,
-  ) {}
+  ) {
+    this.reassembler = new FrameReassembler({
+      onFrame: handlers.onFrame,
+      onDesync: (reason) => {
+        // 어긋난 스트림은 버리고 재연결한다. abort 가 readOnce 의 예외로 이어져
+        // loop 가 백오프 후 다시 붙는다.
+        console.error(`[BinaryFeed] 스트림 desync — 재연결합니다: ${reason}`)
+        this.controller?.abort()
+      },
+    })
+  }
 
   start() {
     this.stopped = false
@@ -53,8 +57,7 @@ export class BinaryFeed {
     this.stopped = true
     this.controller?.abort()
     this.controller = null
-    this.buf = new Uint8Array(0)
-    this.len = 0
+    this.reassembler.reset()
     this.handlers.onState('closed')
   }
 
@@ -94,67 +97,15 @@ export class BinaryFeed {
     // 재연결 간격이 계속 4초에 머문다.
     this.attempt = 0
     this.handlers.onState('open')
-    this.len = 0
+    // 재연결이면 이전 연결의 반쪽 프레임이 남아 있을 수 있다. 그대로 이어붙이면
+    // 새 스트림의 첫 바이트가 옛 조각에 붙어 magic 불일치가 난다.
+    this.reassembler.reset()
 
     const reader = res.body.getReader()
     for (;;) {
       const { done, value } = await reader.read()
       if (done) return
-      if (value) this.push(value)
-    }
-  }
-
-  private ensure(capacity: number) {
-    if (this.buf.length >= capacity) return
-    // 두 배씩 늘린다. 프레임 크기가 플릿 크기에 비례해 커지므로 한 번 자란 뒤에는
-    // 다시 자라지 않는다.
-    const next = new Uint8Array(Math.max(capacity, this.buf.length * 2, 64 * 1024))
-    next.set(this.buf.subarray(0, this.len))
-    this.buf = next
-  }
-
-  private push(chunk: Uint8Array) {
-    this.ensure(this.len + chunk.length)
-    this.buf.set(chunk, this.len)
-    this.len += chunk.length
-    this.drain()
-  }
-
-  /** 버퍼에서 완성된 프레임을 모두 꺼낸다. */
-  private drain() {
-    let offset = 0
-
-    while (this.len - offset >= HEADER_BYTES) {
-      const header = readHeader(this.buf, offset)
-
-      if (header.magic !== MAGIC) {
-        // 스트림이 어긋났다. 여기서 조용히 계속 읽으면 쓰레기 좌표가 지도로 들어간다.
-        // 버퍼를 버리고 재연결하는 쪽이 안전하다.
-        console.error('[BinaryFeed] 프레임 magic 불일치 — 스트림을 리셋합니다')
-        this.len = 0
-        this.controller?.abort()
-        return
-      }
-      if (header.byteLength < HEADER_BYTES) {
-        console.error('[BinaryFeed] 프레임 길이가 헤더보다 작습니다 — 리셋')
-        this.len = 0
-        this.controller?.abort()
-        return
-      }
-      // 프레임이 아직 다 안 왔다. 다음 청크를 기다린다.
-      if (this.len - offset < header.byteLength) break
-
-      // seq 0 은 keep-alive 다. 델타로 넘기면 유실 카운터가 오른다.
-      if (header.seq !== 0) {
-        this.handlers.onFrame(this.buf, offset, header)
-      }
-      offset += header.byteLength
-    }
-
-    // 남은 조각을 앞으로 당긴다.
-    if (offset > 0) {
-      this.buf.copyWithin(0, offset, this.len)
-      this.len -= offset
+      if (value) this.reassembler.push(value)
     }
   }
 }
