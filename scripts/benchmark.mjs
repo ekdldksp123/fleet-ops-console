@@ -7,7 +7,7 @@
  * 재는 대상은 같다 — rAF 호출 간격, 즉 브라우저가 실제로 화면을 그린 시점이다.
  *
  *   node scripts/benchmark.mjs --repeat 3                        # 기본: 렌더 경로 표
- *   node scripts/benchmark.mjs --sizes 20000 --modes canvas --dev # 최적화 단계 표
+ *   node scripts/benchmark.mjs --sizes 20000 --modes canvas --dev --allow-slow
  *   node scripts/benchmark.mjs --seconds 30 --zoom in
  *
  * `--repeat N` 을 쓰면 조건마다 N 회 재고 **중앙값**을 표에 쓴다. 최저 FPS 는 1회
@@ -47,6 +47,9 @@ const SECONDS = Number(flag('seconds', 20))
 const WARMUP = Number(flag('warmup', 8))
 const ZOOM = flag('zoom', 'out') // out = 초기 뷰(전체), in = 더블클릭 2회로 확대
 const REPEAT = Number(flag('repeat', 1))
+// 최적화 전 커밋(0단계)은 20,000대에서 20 FPS 대가 정상이다. 그 경우 아래 서명
+// 판정이 진짜 데이터를 버리므로, 옛 커밋을 잴 때는 --allow-slow 를 준다.
+const ALLOW_SLOW = has('allow-slow')
 const FEED = flag('feed', 'binary')
 const TICK = flag('tick', '')
 const DEV = has('dev')
@@ -65,9 +68,13 @@ function measure(page, seconds) {
         const gaps = []
         let prev = performance.now()
         const start = prev
+        // 측정 도중 창이 앞에서 밀려나면 rAF 가 억제되어 값이 무너진다. 그걸
+        // 나중에 숫자만 보고 추측하지 않도록, 재는 동안 포커스를 같이 기록한다.
+        let focusLost = !document.hasFocus()
         const loop = (now) => {
           gaps.push(now - prev)
           prev = now
+          if (!document.hasFocus()) focusLost = true
           if (now - start >= secs * 1000) {
             const total = now - start
             const worst = Math.max(...gaps)
@@ -76,6 +83,7 @@ function measure(page, seconds) {
               minFps: 1000 / worst,
               worstMs: worst,
               frames: gaps.length,
+              focusLost,
             })
             return
           }
@@ -86,6 +94,18 @@ function measure(page, seconds) {
     seconds,
   )
 }
+
+/**
+ * 창이 가려진 상태에서 나온 값인지 판정한다.
+ *
+ * 두 신호를 쓴다. (1) 측정 중 `document.hasFocus()` 가 false 였는가 — 원인 쪽 신호다.
+ * (2) 결과가 억제된 rAF 의 서명과 일치하는가 — 평균 30 FPS 미만 + 최장 프레임 80ms
+ * 초과. 이 서명은 실측으로 확인한 것이다(가려진 창: 10~14 FPS / 120ms 대). 부하 때문에
+ * 느린 경우와 겹칠 수 있다 — 최적화 전 커밋은 20,000대에서 20 FPS 대가 정상이다.
+ * 그래서 옛 커밋을 잴 때는 `--allow-slow` 로 (2)를 끄고 (1)만 쓴다. (1)은 원인을
+ * 직접 보는 신호라 부하와 무관하다.
+ */
+const looksThrottled = (r) => r.focusLost || (!ALLOW_SLOW && r.fps < 30 && r.worstMs > 80)
 
 let feedNote = null
 
@@ -162,6 +182,7 @@ function median(xs) {
 }
 
 const results = []
+let totalDiscarded = 0
 let browser
 try {
   const headless = has('headless')
@@ -196,16 +217,30 @@ try {
     }
     for (const mode of MODES) {
       const runs = []
-      for (let i = 0; i < REPEAT; i++) {
+      let discarded = 0
+      while (runs.length < REPEAT && discarded < REPEAT * 2 + 2) {
         const r = await run(browser, size, mode)
-        runs.push(r)
-        const tag = REPEAT > 1 ? ` (${i + 1}/${REPEAT})` : ''
+        const bad = looksThrottled(r)
+        const tag = REPEAT > 1 ? ` (${runs.length + (bad ? 0 : 1)}/${REPEAT})` : ''
         console.log(
           `FLEET_SIZE=${String(size).padStart(6)} ${mode.padEnd(6)}${tag}  ` +
             `평균 ${r.fps.toFixed(1).padStart(5)} FPS  최저 ${r.minFps.toFixed(1).padStart(5)}  ` +
-            `최장 ${r.worstMs.toFixed(1).padStart(6)}ms  삼킴 ${r.ingest ?? '—'}  ${r.payload ?? '—'}`,
+            `최장 ${r.worstMs.toFixed(1).padStart(6)}ms  삼킴 ${r.ingest ?? '—'}  ${r.payload ?? '—'}` +
+            (bad ? `  ← 버림 (${r.focusLost ? '측정 중 포커스 상실' : 'rAF 억제 서명'})` : ''),
+        )
+        if (bad) {
+          discarded++
+          continue
+        }
+        runs.push(r)
+      }
+      if (runs.length < REPEAT) {
+        console.log(
+          `  └ ⚠️ 유효 측정 ${runs.length}/${REPEAT} 회 — 창이 계속 가려졌다. 값을 믿지 말 것.`,
         )
       }
+      if (runs.length === 0) continue
+      totalDiscarded += discarded
       const agg = {
         size,
         mode,
@@ -214,6 +249,7 @@ try {
         worstMs: median(runs.map((r) => r.worstMs)),
         minFpsRange: [Math.min(...runs.map((r) => r.minFps)), Math.max(...runs.map((r) => r.minFps))],
         n: runs.length,
+        discarded,
         ingest: runs[runs.length - 1].ingest,
         payload: runs[runs.length - 1].payload,
       }
@@ -238,6 +274,11 @@ try {
 
 // README 에 그대로 붙일 수 있는 형태로 출력한다.
 if (feedNote) console.log(`\n비고: ${feedNote}`)
+if (totalDiscarded) {
+  console.log(
+    `비고: 창이 가려진 상태로 판정해 버린 측정 ${totalDiscarded}회 (재측정으로 대체했다)`,
+  )
+}
 
 if (MODES.length === 2 && MODES[0] === 'canvas') {
   const r1 = (x) => x.toFixed(1)
